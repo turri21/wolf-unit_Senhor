@@ -1,0 +1,10 @@
+set_global_assignment -name FAMILY "Cyclone V"
+set_global_assignment -name DEVICE 5CSEBA6U23I7
+set_global_assignment -name TOP_LEVEL_ENTITY syn_core
+set_global_assignment -name LAST_QUARTUS_VERSION "17.0.2 Lite Edition"
+set_global_assignment -name VHDL_INPUT_VERSION VHDL_2008
+set_global_assignment -name NUM_PARALLEL_PROCESSORS 2
+set_global_assignment -name OPTIMIZATION_MODE "BALANCED"
+set_global_assignment -name OPTIMIZATION_TECHNIQUE SPEED
+source files.qip
+set_global_assignment -name VERILOG_MACRO "SYNTHESIS=1"

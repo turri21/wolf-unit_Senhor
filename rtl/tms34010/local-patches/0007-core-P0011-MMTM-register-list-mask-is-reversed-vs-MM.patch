@@ -1,0 +1,391 @@
+From 5abae9d1b5457f2c812384f1f485e3f6d3c0da52 Mon Sep 17 00:00:00 2001
+From: Matt Levine <blahm1d@gmail.com>
+Date: Sun, 5 Jul 2026 11:07:28 -0800
+Subject: [PATCH 07/12] core: P0011 - MMTM register-list mask is reversed vs
+ MMFM
+
+MMTM and MMFM use opposite bit->register mappings (MMFM: bit N = R(N);
+MMTM: bit N = R(15-N)), verified against MAME's 34010ops.hxx and unidasm
+on real Smash T.V. code (matching push/pop pairs carry bit-reversed list
+words, e.g. MMTM 0x8b00 / MMFM 0x00d1 = {A0,A4,A6,A7}). birdybro mapped
+both identically (A0026), which passes its same-word round-trip TB but
+corrupts registers on real code that pushes/pops the same regs with
+different (reversed) words.
+
+Fix: unify the mm iterator to highest-set-bit-first for both; add
+mm_reg_idx = is_mmtm ? 15-mm_iter_idx : mm_iter_idx to drive the MMTM
+push read port. MMFM unchanged.
+
+This was the boot derail: the string routine at ffea8df0 pushed the
+mirror-image register set, so the ffea8f70 MMFM popped a code address
+(0xFFEA57B0) into A0 -> ffea9090 JRLS fell through where MAME takes it
+-> illegal opcode at fff0a78a (cyc 1745583). Post-fix A0 is correct,
+JRLS matches MAME, boot runs with no derail through 6M cycles.
+
+Also updates the MMTM/MMFM unit TBs to the correct reversed encoding and
+adds a reset-vector init (mem[510]=mem[511]=0) so P0001's reset-vector
+read starts them at word 0 (pre-existing harness breakage, unrelated to
+P0011). tb_mmtm / tb_mmfm / tb_mmtm_nflag all PASS.
+
+---
+ PATCHES.md                  | 67 +++++++++++++++++++++++++++++++++++++
+ rtl/core/tms34010_core.sv   | 44 ++++++++++++++----------
+ rtl/core/tms34010_decode.sv | 25 ++++++++------
+ sim/tb/tb_mmfm.sv           | 15 ++++++---
+ sim/tb/tb_mmtm.sv           | 37 +++++++++++++-------
+ sim/tb/tb_mmtm_nflag.sv     | 11 ++++--
+ 6 files changed, 151 insertions(+), 48 deletions(-)
+
+diff --git a/PATCHES.md b/PATCHES.md
+index e1550f8..c566181 100644
+--- a/PATCHES.md
++++ b/PATCHES.md
+@@ -336,3 +336,70 @@ match MAME at `FFE0F8A0`.**
+ **Upstream note (P0009+P0010).** Both are real TMS34010 PIXBLT-writeback bugs, not
+ Y-unit-specific — offer upstream to birdybro. (The XY-source SADDR writeback is the
+ analogous case for `blt_src_xy`; not yet exercised by this game, left as-is.)
++
++---
++
++## P0011 — MMTM register-list mask is REVERSED vs MMFM (was mapped identically)
++
++**Status:** ✅ APPLIED + VERIFIED 2026-07-05. `grep -rn P0011 rtl/`.
++
++**Applied edits (all in the vendored core):**
++- `rtl/core/tms34010_core.sv` (mm iterator): the priority encoder now selects the
++  **highest** set mask bit for **both** MMTM and MMFM (was: MMFM highest / MMTM
++  lowest); new signal `mm_reg_idx = is_mmtm ? (4'd15 - mm_iter_idx) : mm_iter_idx`
++  drives read-port-1 for the MMTM push (was `mm_iter_idx`). The bit-clear + address
++  stepping keep using `mm_iter_idx` (the bit index).
++- `rtl/core/tms34010_decode.sv`: corrected the MMTM/MMFM A0026 comments.
++- `sim/tb/tb_mmtm.sv`, `sim/tb/tb_mmfm.sv`, `sim/tb/tb_mmtm_nflag.sv`: masks updated to
++  the correct reversed-MMTM encoding (bit-reverse of the direct-map word), and a
++  **reset-vector init** added (see "Harness" below).
++
++**Problem.** MMTM and MMFM use **opposite** register-list bit orderings:
++- **MMFM**: mask bit N = register R(N)      (direct).
++- **MMTM**: mask bit N = register R(15−N)   (reversed).
++
++So the TI assembler emits **mirror-image** list words for a matching push/pop pair.
++birdybro (assumption A0026) mapped **both** as `bit N = R(N)`, which passes its own
++round-trip TB (same word for push and pop → self-consistent) but is wrong on real
++code, where a routine pushes and pops the **same** registers with **different**
++(reversed) words. Result: MMTM pushed the mirror-image register set, so a later MMFM
++popped garbage.
++
++**Evidence (real ROM + MAME, authoritative).**
++- **MAME `34010ops.hxx`:** `MMFM` loops `for(i=15;i>=0;i--){ if(l&0x8000) R(i)=RLONG(Rp); Rp+=0x20; l<<=1; }`
++  → bit N controls R(N). `MMTM` loops `for(i=0;i<16;i++){ if(l&0x8000){ Rp-=0x20; WLONG(Rp,R(i)); } l<<=1; }`
++  → bit (15−N) controls R(N), i.e. bit N = R(15−N).
++- **`unidasm -arch tms34010` on Smash T.V.:** matching pairs carry bit-reversed words —
++  `MMTM SP,A0,A7` = `0x8100` vs `MMFM SP,A0,A7` = `0x0081`; `MMTM SP,A0,A4,A6,A7`
++  (`ffea8df0`) = `0x8b00` vs `MMFM SP,A0,A4,A6,A7` (`ffea8f70`) = `0x00d1`. `0x8b00`
++  is the exact bit-reverse of `0x00d1`.
++- **The failure that surfaced it:** the boot's string routine at `ffea8df0` does
++  `MMTM SP,A0,A4,A6,A7` (`0x8b00`) … `MMFM SP,A0,A4,A6,A7` (`0x00d1`). Pre-fix the core
++  read `0x8b00` as regs {A8,A9,A11,A15} and pushed those, so the MMFM popped a code
++  address into **A0** (measured `A0<=0xFFEA57B0` at the `ffea8f90` pop, `tb_yunit_derail`).
++  That made `ffea9090: JRLS` (after `CMP A10,A0`) fall through where MAME takes it →
++  derail to an illegal opcode at `fff0a78a` (cyc 1745583). Post-fix `A0` is the correct
++  small count, the JRLS is **taken** (matches MAME), and the boot runs with **no derail
++  through 6M cycles** (was: derail at 1.75M).
++
++**Why boot appeared to "work" before:** the code reaching `FFE0F8A0` used mostly
++contiguous masks and/or didn't let a mis-popped register reach a compared value, so
++all 31 regs still matched MAME at main entry (identical pre/post fix). The non-
++contiguous `{A0,A4,A6,A7}` pair in the string routine was the first to route a
++mirror-swapped register into a control-flow compare.
++
++**Harness note (pre-existing, fixed here).** Our P0001 reset-vector read means the
++core now fetches its initial PC from `0xFFFFFFE0`. The MM unit TBs never initialized
++that vector; in their small NOP-filled memories it wrapped to a NOP word, so the
++initial PC came up `0x03000300` and (for `tb_mmtm`) skipped the register-load
++preamble — a **pre-existing** breakage independent of P0011 (`tb_mmtm` failed
++identically on the un-patched core). Fixed by pointing the reset vector at word 0
++(`mem[510]=mem[511]=0` in the 512-word TBs; `tb_mmfm`'s vector words were already 0).
++
++**Verification.** `tb_mmtm` (absolute stack layout, 8 regs), `tb_mmfm` (TI-spec
++example + round-trip), `tb_mmtm_nflag` all **PASS** under Questa FSE 25.1std; the
++integrated boot (`tb_yunit_derail`) runs past the old derail.
++
++**Upstream note.** Real core bug, not Y-unit-specific — offer upstream to birdybro
++together with the reversed-MMTM unit vectors (birdybro's round-trip TB used the same
++word for push and pop, the exact blind spot that hid this — same family as P0003/P0008).
+diff --git a/rtl/core/tms34010_core.sv b/rtl/core/tms34010_core.sv
+index 04bd3ad..5f4abe2 100644
+--- a/rtl/core/tms34010_core.sv
++++ b/rtl/core/tms34010_core.sv
+@@ -984,15 +984,23 @@ module tms34010_core
+   //     final value (= initial + 32*count) points one word past the data,
+   //     written back as the new Rp.
+   //
+-  // Assumption A0026: bit N of the mask = register R(N) for both
+-  // instructions. The spec's chart was a graphical figure unrecoverable
+-  // from pdftotext; the MMTM→MMFM round-trip test is the real check, and
+-  // it only depends on MMTM/MMFM agreeing on the mapping, not its
+-  // absolute value.
++  // Bit->register mapping (P0011, was assumption A0026): MMTM and MMFM use
++  // OPPOSITE mask bit orderings — verified against MAME's decoder (unidasm)
++  // on real Smash T.V. code, where a matching push/pop pair carries
++  // mirror-image list words (e.g. MMTM 0x8B00 / MMFM 0x00D1 both name
++  // {A0,A4,A6,A7}):
++  //   - MMFM: mask bit N = register R(N)      (direct;  SPVU001A p.12-109).
++  //   - MMTM: mask bit N = register R(15-N)   (reversed; SPVU001A p.12-111).
++  // The earlier "bit N = R(N) for both" (A0026) passed birdybro's
++  // round-trip TB (it only checks push-then-pop with the SAME word) but is
++  // wrong on real code, which pushes and pops the same registers with
++  // DIFFERENT (reversed) words. mm_iter_idx below is the selected MASK BIT;
++  // mm_reg_idx is the register it names (complemented for MMTM).
+   // ---------------------------------------------------------------------------
+   logic [DATA_WIDTH-1:0] mm_rp_q;
+   logic [15:0]           mm_mask_q;
+   logic [3:0]            mm_iter_idx;
++  logic [3:0]            mm_reg_idx;
+   logic                  mm_mask_will_be_empty;
+   logic                  is_mmtm, is_mmfm, is_mm;
+ 
+@@ -1000,22 +1008,22 @@ module tms34010_core
+   assign is_mmfm = (decoded.iclass == INSTR_MMFM);
+   assign is_mm   = is_mmtm || is_mmfm;
+ 
++  // Both MMTM and MMFM process the HIGHEST set mask bit first, one bit per
++  // memory transaction, clearing it after each ack (P0011). Highest-first is
++  // correct for both because their register maps are mirror images:
++  //   - MMFM (bit N = R(N)):    bit 15 = highest register, restored first
++  //     from the lowest stack address (postincrement).  MAME i=15..0.
++  //   - MMTM (bit N = R(15-N)): bit 15 = register R0, pushed first to the
++  //     highest stack address (predecrement).            MAME i=0..15.
+   always_comb begin
+     mm_iter_idx = 4'd0;
+-    if (is_mmfm) begin
+-      // MMFM: highest set bit. Iterate low→high so the LAST overwrite
+-      // (the largest i with mm_mask_q[i]=1) wins.
+-      for (int i = 0; i < 16; i++) begin
+-        if (mm_mask_q[i]) mm_iter_idx = 4'(i);
+-      end
+-    end else begin
+-      // MMTM: lowest set bit. Iterate high→low so the loop terminates
+-      // on the smallest i with mm_mask_q[i]=1.
+-      for (int i = 15; i >= 0; i--) begin
+-        if (mm_mask_q[i]) mm_iter_idx = 4'(i);
+-      end
++    for (int i = 0; i < 16; i++) begin
++      if (mm_mask_q[i]) mm_iter_idx = 4'(i);   // last (highest) set bit wins
+     end
+   end
++  // Register named by the current mask bit: direct for MMFM, 15's-complement
++  // for MMTM (the reversed map). Drives read port 1 for the MMTM push.
++  assign mm_reg_idx = is_mmtm ? (4'd15 - mm_iter_idx) : mm_iter_idx;
+   // After we clear the bit at mm_iter_idx, will the mask be empty? Gates
+   // the FSM transition (last transaction → WRITEBACK) and, for MMTM,
+   // suppresses the final Rp-decrement.
+@@ -1177,7 +1185,7 @@ module tms34010_core
+                      : is_pblt ? ((state_q == CORE_PBLT_SETUP_WIN) ? CPW_WSTART_IDX
+                                 : (state_q == CORE_PBLT_SETUP2) ? B_COLOR0_IDX
+                                 : (state_q == CORE_PBLT_SETUP)  ? B_SPTCH_IDX : B_SADDR_IDX)
+-                     : (state_q == CORE_MEMORY && is_mmtm) ? mm_iter_idx
++                     : (state_q == CORE_MEMORY && is_mmtm) ? mm_reg_idx
+                      : (is_drav && (state_q == CORE_DRAV_SETUP_WIN)) ? CPW_WSTART_IDX // WSTART
+                      : (is_drav && (state_q == CORE_DRAV)) ? B_COLOR1_IDX  // COLOR1 for the draw
+                      : (is_line && (state_q == CORE_LINE_SETUP1)) ? B_SADDR_IDX   // d (B0)
+diff --git a/rtl/core/tms34010_decode.sv b/rtl/core/tms34010_decode.sv
+index 970e0ac..b30ffa5 100644
+--- a/rtl/core/tms34010_decode.sv
++++ b/rtl/core/tms34010_decode.sv
+@@ -287,23 +287,26 @@ module tms34010_decode
+   // page 12-111. Encoding `0000 1001 100R DDDD` (top11 =
+   // 11'b00001001_100), where R=instr[4] is the register file and
+   // DDDD=instr[3:0] is Rp's index. The second instruction word is a
+-  // 16-bit binary mask indicating which registers are in the list
+-  // (assumption A0026: bit N of mask = register R(N) for both MMTM
+-  // and MMFM). Iteration order is lowest-order register first per
+-  // the spec's "lowest order register is always saved first".
+-  // For each set bit, Rp is predecremented by 32 and the matching
+-  // register's 32-bit value is written. Final Rp is left pointing
+-  // at the lowest written address.
++  // 16-bit binary mask indicating which registers are in the list.
++  // P0011 (corrected A0026): for MMTM the map is REVERSED —
++  // mask bit N = register R(15-N) — so the lowest-numbered register
++  // (highest mask bit) is saved first per the spec's "lowest order
++  // register is always saved first". For each register, in ascending
++  // register order, Rp is predecremented by 32 and the 32-bit value is
++  // written; final Rp points at the lowest written address. The
++  // iterator + reversed map live in tms34010_core.sv (mm_reg_idx).
+   localparam logic [10:0] MMTM_TOP11      = 11'b0000_1001_100;
+ 
+   // MMFM Rp, register list — Move Multiple from Memory (the pop
+   // counterpart of MMTM). Per SPVU001A page 12-109. Encoding
+   // `0000 1001 101R DDDD` (top11 = 11'b00001001_101), with R=instr[4]
+   // the register file and DDDD=instr[3:0] the Rp index. The second
+-  // instruction word is the same 16-bit register-list mask used by
+-  // MMTM (A0026: bit N = register R(N)). Iteration order is
+-  // HIGHEST-order register first per the spec ("the highest order
+-  // register is always restored first"). For each set bit, a 32-bit
++  // instruction word is a 16-bit register-list mask. For MMFM the map
++  // is DIRECT — mask bit N = register R(N) — the mirror image of MMTM's
++  // reversed map (P0011), so the assembler emits different list words
++  // for a matching MMFM/MMTM pair. Iteration order is HIGHEST-order
++  // register first per the spec ("the highest order register is always
++  // restored first"). For each set bit, a 32-bit
+   // value is read from mem[Rp] into the register and Rp is then
+   // post-incremented by 32 — including after the last register, so
+   // final Rp = initial Rp + 32*count (points one word past the data).
+diff --git a/sim/tb/tb_mmfm.sv b/sim/tb/tb_mmfm.sv
+index eb8d94c..9bce16a 100644
+--- a/sim/tb/tb_mmfm.sv
++++ b/sim/tb/tb_mmfm.sv
+@@ -123,8 +123,13 @@ module tb_mmfm;
+ 
+   // ---- PHASE-1 (round-trip) parameters -------------------------------------
+   localparam logic [DATA_WIDTH-1:0] RP1_INIT = 32'h0000_0800;   // A1 = Rp
+-  // {A0,A2,A4,A8,A12,A13,A14} (no SP) = bits 0,2,4,8,12,13,14 = 0x7115.
+-  localparam logic [15:0]           MASK1    = 16'h7115;
++  // {A0,A2,A4,A8,A12,A13,A14} (no SP). MMFM (direct map, bit N = R(N)) =
++  // bits 0,2,4,8,12,13,14 = 0x7115. The matching MMTM push uses the
++  // REVERSED map (P0011, bit N = R(15-N)) so its word is the bit-reverse
++  // of 0x7115 -> 0xA88E. Pushing with MASK1_TM and popping with MASK1
++  // round-trips the same register set (mirror-image words = same regs).
++  localparam logic [15:0]           MASK1    = 16'h7115;   // MMFM (pop) word
++  localparam logic [15:0]           MASK1_TM = 16'hA88E;   // MMTM (push) word
+   localparam logic [DATA_WIDTH-1:0] GARBAGE  = 32'hDEAD_BEEF;
+ 
+   // ---- PHASE-2 (TI spec example) parameters --------------------------------
+@@ -168,9 +173,11 @@ module tb_mmfm;
+     end
+     p = place_movi_il(p, 1'b0, 4'd1, RP1_INIT);          // A1 = Rp
+ 
+-    // MMTM A1, MASK1 — push the 7 registers. Encoding 0x0981 + mask.
++    // MMTM A1, MASK1_TM — push the 7 registers. Encoding 0x0981 + mask.
++    // MMTM's reversed map (P0011) needs the bit-reversed word so the same
++    // registers MMFM pops (MASK1) are the ones pushed here.
+     p = place_word(p, 16'h0981);
+-    p = place_word(p, MASK1);
++    p = place_word(p, MASK1_TM);
+ 
+     // Corrupt every pushed register so a failed restore is visible.
+     foreach (LIST1[i]) begin
+diff --git a/sim/tb/tb_mmtm.sv b/sim/tb/tb_mmtm.sv
+index cd6840c..4b96238 100644
+--- a/sim/tb/tb_mmtm.sv
++++ b/sim/tb/tb_mmtm.sv
+@@ -3,18 +3,21 @@
+ //
+ // MMTM Rp, register list — Move Multiple Registers to Memory. Per
+ // SPVU001A page 12-111. Encoding `0000 1001 100R DDDD` + 16-bit mask
+-// word. For each register Rn in the list (lowest-order first), Rp is
+-// predecremented by 32 and Rn's 32-bit value is written to mem[Rp].
++// word. For each register Rn in the list (lowest-numbered register saved
++// first, to the highest address), Rp is predecremented by 32 and Rn's
++// 32-bit value is written to mem[Rp]. The mask uses the REVERSED map
++// (P0011: bit N = register R(15-N)) — see the MASK localparam.
+ //
+ // This is the first instruction in the project where the *number* of
+ // memory transactions is data-dependent — it equals the population
+ // count of the second instruction word. Up to 16 32-bit writes.
+ //
+-// Assumption A0026 (also called out in tms34010_core.sv): bit N of
+-// the mask = register R(N). The spec's actual chart is a graphical
+-// figure that didn't survive pdftotext extraction; this reading is
+-// consistent with the spec's "lowest-order register is always saved
+-// first" requirement when the iterator scans LSB-first.
++// Bit->register mapping (P0011, corrects assumption A0026): for MMTM
++// mask bit N = register R(15-N) — the REVERSED map, verified against
++// MAME's decoder on real Smash T.V. code. The lowest-numbered register
++// (highest mask bit) is saved first (highest stack address), satisfying
++// the spec's "lowest-order register is always saved first". So to push a
++// register set the mask is the bit-reverse of the MMFM (direct-map) word.
+ //
+ // Test plan:
+ //   1. Pre-load A0..A14 with recognisable values (0xAnAnAnAn-style).
+@@ -119,9 +122,11 @@ module tb_mmtm;
+ 
+   // Rp = A1; initial Rp bit-address = 0x0800 = word 128.
+   localparam logic [DATA_WIDTH-1:0] RP_INIT = 32'h0000_0800;
+-  // Mask for {A0, A2, A4, A8, A12, A13, A14, A15} = bits 0,2,4,8,12,13,14,15
+-  // = 0xF115 (1111_0001_0001_0101).
+-  localparam logic [15:0]           MASK    = 16'hF115;
++  // Mask for {A0, A2, A4, A8, A12, A13, A14, A15}. Under the reversed MMTM
++  // map (P0011: bit N = R(15-N)) that is the bit-reverse of the direct-map
++  // word 0xF115 -> 0xA88F (bits 15,13,11,7,3,2,1,0). This pushes the SAME
++  // register set with the SAME stack layout the checks below assert.
++  localparam logic [15:0]           MASK    = 16'hA88F;
+ 
+   // Per-register sentinel values for A0..A15. A1 (Rp) is set
+   // separately and must NOT be in the list per spec.
+@@ -138,6 +143,13 @@ module tb_mmtm;
+     for (i = 0; i < 512; i++) begin
+       u_mem.mem[i] = 16'h0300;
+     end
++    // Reset vector: the core (P0001) fetches its initial PC from bit-address
++    // 0xFFFFFFE0. In this 512-word model that address wraps to words 510/511;
++    // point it at bit-address 0 so execution starts at the program (word 0).
++    // Without this the initial PC = {NOP,NOP} = 0x03000300 -> wraps to word 48,
++    // skipping the register-load preamble.
++    u_mem.mem[510] = 16'h0000;   // reset-vector low  word
++    u_mem.mem[511] = 16'h0000;   // reset-vector high word
+ 
+     // ---- Pre-program: load A0..A14 (skip A1 which we'll set last
+     //      since its value is Rp), then load A15 (SP), then MMTM. -----
+@@ -177,6 +189,7 @@ module tb_mmtm;
+     repeat (4000) @(posedge clk);
+     #1;
+ 
++
+     // -------- Checks --------------------------------------------------
+     // Final A1 = RP_INIT - 8*32 = 0x0800 - 0x100 = 0x0700.
+     check_reg("MMTM: A1 (Rp) = RP_INIT - 8*32",
+@@ -184,7 +197,7 @@ module tb_mmtm;
+ 
+     // Stack layout: lowest-order register (A0) at HIGHEST address;
+     // highest-order register (A15=SP) at LOWEST address.
+-    // Push order LSB→MSB: A0, A2, A4, A8, A12, A13, A14, A15(=SP).
++    // Push order (register-index ascending): A0, A2, A4, A8, A12, A13, A14, A15(=SP).
+     // Address (in bit-units): RP_INIT - 32, RP_INIT - 64, ...
+     // Word index (= bit_addr / 16):
+     //   A0  at bit 0x07E0 = word 126 (low) + 127 (high)
+@@ -220,7 +233,7 @@ module tb_mmtm;
+     end
+ 
+     if (failures == 0) begin
+-      $display("TEST_RESULT: PASS (MMTM: 8 registers pushed LSB-first; Rp = RP_INIT - 256)");
++      $display("TEST_RESULT: PASS (MMTM: 8 registers pushed register-index-ascending; Rp = RP_INIT - 256)");
+     end else begin
+       $display("TEST_RESULT: FAIL: %0d check(s) failed", failures);
+     end
+diff --git a/sim/tb/tb_mmtm_nflag.sv b/sim/tb/tb_mmtm_nflag.sv
+index 95f2217..5c3d2c4 100644
+--- a/sim/tb/tb_mmtm_nflag.sv
++++ b/sim/tb/tb_mmtm_nflag.sv
+@@ -93,14 +93,14 @@ module tb_mmtm_nflag;
+   endfunction
+ 
+   // One N-flag case: reload A1=Rp, MMTM A1,{A0}, snapshot ST into A<snap>.
+-  //   MMTM A1 = 0x0981, mask = 0x0001 (push A0 only).
+-  //   GETST A<snap> = 0x0180 | snap.
++  //   MMTM A1 = 0x0981, mask = 0x8000 (push A0 only; MMTM reversed map
++  //   P0011: bit 15 = R0). GETST A<snap> = 0x0180 | snap.
+   function automatic int unsigned place_case(input int unsigned p,
+                                              input logic [DATA_WIDTH-1:0] rp_val,
+                                              input reg_idx_t snap);
+     p = place_movi_il(p, 4'd1, rp_val);     // A1 = Rp
+     p = place_word(p, 16'h0981);            // MMTM A1, mask
+-    p = place_word(p, 16'h0001);            //   mask = {A0}
++    p = place_word(p, 16'h8000);            //   mask = {A0} (reversed map: bit15=R0)
+     p = place_word(p, 16'h0180 | instr_word_t'(snap)); // GETST A<snap>
+     place_case = p;
+   endfunction
+@@ -124,6 +124,11 @@ module tb_mmtm_nflag;
+     for (i = 0; i < 512; i++) begin
+       u_mem.mem[i] = 16'h0300;          // NOP-fill
+     end
++    // Reset vector: core (P0001) reads its initial PC from 0xFFFFFFE0, which
++    // wraps to words 510/511 in this 512-word model. Point it at word 0 so
++    // execution starts at the program (else PC = {NOP,NOP} = 0x03000300).
++    u_mem.mem[510] = 16'h0000;
++    u_mem.mem[511] = 16'h0000;
+ 
+     // A0 holds the (don't-care) value that each MMTM pushes.
+     p = 0;
+-- 
+2.53.0.windows.2
+

@@ -1,0 +1,72 @@
+From 15029cd8183a56e38b053ea59c02fc9a731b47de Mon Sep 17 00:00:00 2001
+From: Matt Levine <blahm1d@gmail.com>
+Date: Sun, 5 Jul 2026 02:51:34 -0800
+Subject: [PATCH 04/12] core: P0007 - MOVK/ADDK/SUBK constant field value 0
+ encodes 32
+
+The TMS34010 MOVK/ADDK/SUBK constant is 1..32 with a field value of 0 meaning 32.
+The core used k5 directly, so "SUBK 20h" (32) subtracted 0. Smash T.V.'s char->
+glyph lookup does SUBK 20h on the ASCII code; the bug garbled all on-screen text.
+Fixed: map k5==0 -> 32 for these three (DSJ* keep k5, they decrement by 1).
+Verified vs MAME: glyph SADDR matches (fff55ab8), rendered attract text now legible.
+
+---
+ PATCHES.md                | 25 +++++++++++++++++++++++++
+ rtl/core/tms34010_core.sv |  6 +++++-
+ 2 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/PATCHES.md b/PATCHES.md
+index b8e136d..df0ab08 100644
+--- a/PATCHES.md
++++ b/PATCHES.md
+@@ -211,3 +211,28 @@ loop completes the full 263-object attract layer (was hanging at object 176).
+ **Note.** Only `CORE_PBLT_SETUP` is guarded (covers all PIXBLT forms — the check runs
+ before the binary/windowed sub-setups). FILL uses a separate FSM; if a 0-dimension FILL
+ ever appears, add the analogous guard to its setup.
++
++---
++
++## P0007 — MOVK/ADDK/SUBK constant field: value 0 encodes 32
++
++**Status:** ✅ APPLIED + VERIFIED 2026-07-05. `grep -rn P0007 rtl/`.
++
++**Applied edit:** `rtl/core/tms34010_core.sv` (`alu_b` mux) — split `MOVK/ADDK/SUBK`
++out of the shared `DSJ*` arm and map a `k5` field of 0 to the value 32:
++`alu_b = (decoded.k5 == 0) ? 32'd32 : {..,k5};`
++
++**Problem.** The TMS34010 `MOVK`/`ADDK`/`SUBK` constant field holds 1..32, with a
++field value of **0 encoding 32** (UG). The core used `k5` directly, so e.g.
++`SUBK 20h` (subtract 32, field 0) subtracted **0**. (`DSJ*` share the field format
++but always decrement by 1, so they keep k5 as-is.)
++
++**Evidence (real ROM + MAME).** Smash T.V. attract char→glyph lookup:
++`fff4fc70 SUBK 20h,A4` on char `'U'`=0x55 → MAME `0x35`, our core `0x55`
++(unchanged). That cascaded to the wrong glyph-index (`0x18` vs `0x22`), wrong font
++SADDR (`fff557e8` vs MAME `fff55ab8`), and garbled on-screen text. Post-fix the
++whole chain matches MAME (SADDR `fff55ab8`) and the rendered attract text is legible
++and correct (U-number ROM labels).
++
++**Upstream note (P0004-P0007).** All four are real TMS34010 core bugs surfaced by
++running real game code — offer upstream to birdybro. None is Y-unit-specific.
+diff --git a/rtl/core/tms34010_core.sv b/rtl/core/tms34010_core.sv
+index cc504d5..dde662b 100644
+--- a/rtl/core/tms34010_core.sv
++++ b/rtl/core/tms34010_core.sv
+@@ -1924,9 +1924,13 @@ module tms34010_core
+       INSTR_ANDI_IL,
+       INSTR_ORI_IL,
+       INSTR_XORI_IL: alu_b = imm32;
++      // P0007: MOVK/ADDK/SUBK take a constant in 1..32 with a field value of 0
++      // encoding 32 (TMS34010 UG). The core used k5 directly, so "SUBK 20h" (32,
++      // field 0) subtracted 0 -> garbled text/sprite glyph lookups. Map 0 -> 32.
+       INSTR_MOVK,
+       INSTR_ADDK,
+-      INSTR_SUBK,
++      INSTR_SUBK:    alu_b = (decoded.k5 == 5'd0) ? 32'd32
++                                                  : {{(DATA_WIDTH-5){1'b0}}, decoded.k5};
+       INSTR_DSJ,
+       INSTR_DSJEQ,
+       INSTR_DSJNE,
+-- 
+2.53.0.windows.2
+

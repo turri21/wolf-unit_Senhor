@@ -1,0 +1,12 @@
+# Phase 6 source list. The game-side SystemVerilog is down-converted to Verilog by
+# quartus/build_sv2v.sh (sv2v) -> ../build_syn/smashtv_core.v, because Quartus 17.0
+# Lite's SV parser rejects the vendored TMS34010 core's size-casts. Run build_sv2v.sh
+# BEFORE compiling. VHDL + jt51/mc6809/pia stay as-is (sv2v is SV-only).
+set_global_assignment -name VERILOG_FILE ../build_syn/smashtv_core.v
+# --- sound board (VHDL + Verilog, not touched by sv2v) — add for the full build ---
+# set_global_assignment -name VHDL_FILE ../rtl/sound/williams_cvsd/gen_ram.vhd
+# set_global_assignment -name VHDL_FILE ../rtl/sound/williams_cvsd/hc55564.vhd
+# set_global_assignment -name VHDL_FILE ../rtl/sound/williams_cvsd/pia6821.vhd
+# set_global_assignment -name VHDL_FILE ../rtl/sound/williams_cvsd/williams_cvsd_board.vhd
+# set_global_assignment -name VERILOG_FILE ../rtl/sound/williams_cvsd/mc6809is.v
+# (+ jt51 hdl/*.v)

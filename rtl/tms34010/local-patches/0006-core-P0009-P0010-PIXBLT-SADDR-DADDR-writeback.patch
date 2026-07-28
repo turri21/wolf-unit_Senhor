@@ -1,0 +1,138 @@
+From fd41e321fb7706ade80cea5549332f116dbac355 Mon Sep 17 00:00:00 2001
+From: Matt Levine <blahm1d@gmail.com>
+Date: Sun, 5 Jul 2026 10:04:01 -0800
+Subject: [PATCH 06/12] core: P0009 + P0010 - PIXBLT SADDR/DADDR writeback
+
+Two PIXBLT register-writeback bugs found by full-regfile diff vs MAME at the
+Smash T.V. main-code entry (FFE0F8A0):
+
+P0009 - PIXBLT left SADDR short by (pitch - width) bits. After a blit the 34010
+leaves SADDR at base + DY*SPTCH (start of the row past the array) so consecutive
+PIXBLTs walk a sprite sheet; the core's row-end advance was gated !pblt_done, so
+the last row's advance was suppressed, leaving SADDR at last-row + width. Fix: on
+the final pixel, advance SADDR/DADDR to the next-row start. Measured: font glyph
+(SPTCH 8, width 6) came out 2 bits short (FFF55826 vs MAME FFF55828).
+
+P0010 - PIXBLT with an XY destination wrote DADDR back as the internal LINEAR
+address instead of XY. The 34010/MAME leave DADDR as XY {ystart+DY, xstart}. Fix:
+for blt_dst_xy, write the XY value from the latched pblt_dst_xy_raw_q. Measured:
+B2 = linear 000976C0 vs MAME XY 009700D8.
+
+With both fixed, all 31 registers match MAME exactly at FFE0F8A0.
+
+---
+ PATCHES.md                | 48 +++++++++++++++++++++++++++++++++++++++
+ rtl/core/tms34010_core.sv | 28 +++++++++++++++++++----
+ 2 files changed, 72 insertions(+), 4 deletions(-)
+
+diff --git a/PATCHES.md b/PATCHES.md
+index 1e54b2c..e1550f8 100644
+--- a/PATCHES.md
++++ b/PATCHES.md
+@@ -288,3 +288,51 @@ in the self-test exposed it.
+ **Upstream note.** Real core bug, not Y-unit-specific — offer upstream to birdybro
+ together with corrected SUBI/CMPI unit vectors (birdybro's per-instruction TBs pass
+ the *un-complemented* immediate, the same blind spot that hid P0003's ANDI).
++
++---
++
++## P0009 — PIXBLT leaves SADDR short by (pitch − width) bits
++
++**Status:** ✅ APPLIED + VERIFIED 2026-07-05. `grep -rn P0009 rtl/`.
++
++**Applied edit:** `rtl/core/tms34010_core.sv` (CORE_PBLT write-ack) — on the FINAL
++pixel (`pblt_done`), advance `pblt_src_addr_q`/`pblt_dst_addr_q` to the next row
++start (`src_row + SPTCH` / `dst_row + DPTCH`) instead of leaving them at
++last-row-start + width. The row-end advance was gated `!pblt_done`, so the last
++row's advance was suppressed.
++
++**Problem.** After a PIXBLT the TMS34010 leaves SADDR pointing to the source of the
++row PAST the array (`base + DY*SPTCH`), so consecutive PIXBLTs walk a sprite sheet /
++proportional font. The core left SADDR at `last-row-start + width` = `base +
++(DY-1)*SPTCH + width`, short by `SPTCH - width` bits.
++
++**Evidence (real ROM + MAME).** Smash T.V. self-test font glyph: base `FFF557E8`,
++DYDX `0x00080006` (8 rows, width 6), SPTCH 8. MAME advances SADDR to `FFF55828`
++(`base + 8*8 = +0x40`); pre-fix the core gave `FFF55826` (`base + 7*8 + 6 = +0x3e`),
++2 bits short. Post-fix B0 = `FFF55828`, matching MAME. Verified via the full-regfile
++diff at `FFE0F8A0` (`sim/tb_yunit_derail.sv`).
++
++---
++
++## P0010 — PIXBLT with XY destination writes DADDR back as linear, not XY
++
++**Status:** ✅ APPLIED + VERIFIED 2026-07-05. `grep -rn P0010 rtl/`.
++
++**Applied edit:** `rtl/core/tms34010_core.sv` (`rf_wr_data` mux, `INSTR_PIXBLT_LL`) —
++for `decoded.blt_dst_xy`, write DADDR back as the XY address of the row below the
++array (`{ystart+DY, xstart}` from the latched `pblt_dst_xy_raw_q` + `pblt_dy_q`)
++instead of the internal linear `pblt_dst_addr_q`.
++
++**Problem.** For a PIXBLT with an XY destination the DADDR register holds an XY
++address; the core converts it to linear at SETUP for addressing but then wrote the
++LINEAR value back to B2. The TMS34010/MAME leave DADDR as XY (advanced by one array
++height in Y).
++
++**Evidence (real ROM + MAME).** Same font glyph: dest XY `008F00D8` (Y=0x8F, X=0xD8),
++DY=8. MAME leaves B2 = `009700D8` (`{0x8F+8, 0xD8}`); pre-fix the core wrote the
++linear `000976C0`. Post-fix B2 = `009700D8`, matching MAME — **all 31 registers now
++match MAME at `FFE0F8A0`.**
++
++**Upstream note (P0009+P0010).** Both are real TMS34010 PIXBLT-writeback bugs, not
++Y-unit-specific — offer upstream to birdybro. (The XY-source SADDR writeback is the
++analogous case for `blt_src_xy`; not yet exercised by this game, left as-is.)
+diff --git a/rtl/core/tms34010_core.sv b/rtl/core/tms34010_core.sv
+index 4e14a48..04bd3ad 100644
+--- a/rtl/core/tms34010_core.sv
++++ b/rtl/core/tms34010_core.sv
+@@ -735,14 +735,24 @@ module tms34010_core
+           pblt_substep_q  <= 2'd0;
+           pblt_src_addr_q <= pblt_src_addr_q + pblt_src_step;
+           pblt_dst_addr_q <= pblt_dst_addr_q + pblt_psize_ext;
+-          if (pblt_row_end && !pblt_done) begin
++          if (pblt_done) begin
++            // P0009: on the FINAL pixel, leave SADDR/DADDR pointing at the START
++            // of the row PAST the array (base + DY*pitch) — matching the TMS34010
++            // UG / MAME, so consecutive PIXBLTs walk a sprite sheet. The row-end
++            // advance below was gated `!pblt_done`, which left SADDR at
++            // last-row-start + width, short by (pitch - width) bits. Measured on a
++            // Smash T.V. font glyph (SPTCH=8, width=6): SADDR came out 2 bits short
++            // of MAME (FFF55826 vs FFF55828).
++            pblt_src_addr_q <= pblt_src_row_q + pblt_sptch_q;
++            pblt_dst_addr_q <= pblt_dst_row_q + pblt_dptch_q;
++          end else if (pblt_row_end) begin
+             pblt_y_q        <= pblt_y_q + 16'd1;
+             pblt_src_row_q  <= pblt_src_row_q + pblt_sptch_q;
+             pblt_dst_row_q  <= pblt_dst_row_q + pblt_dptch_q;
+             pblt_src_addr_q <= pblt_src_row_q + pblt_sptch_q;
+             pblt_dst_addr_q <= pblt_dst_row_q + pblt_dptch_q;
+             pblt_x_q        <= 16'd0;
+-          end else if (!pblt_done) begin
++          end else begin
+             pblt_x_q <= pblt_x_q + 16'd1;
+           end
+         end
+@@ -1847,8 +1857,18 @@ module tms34010_core
+       INSTR_CVXYL:  rf_wr_data = cvxyl_result;
+       INSTR_FILL_L,
+       INSTR_FILL_XY: rf_wr_data = fill_addr_q;  // final (linear) DADDR -> B2 (CORE_FILL_WB)
+-      INSTR_PIXBLT_LL: rf_wr_data = pblt_wb_saddr ? pblt_src_addr_q   // SADDR -> B0
+-                                                  : pblt_dst_addr_q;  // DADDR -> B2
++      // P0010: for an XY destination, PIXBLT leaves DADDR as an XY address (the
++      // start of the row below the array = {ystart+DY, xstart}), NOT the internal
++      // linear address it was converted to at SETUP. Measured vs MAME: a font
++      // glyph left B2 = linear 000976c0 where MAME keeps XY 009700d8. (Linear-dest
++      // PIXBLT still writes the linear pblt_dst_addr_q; XY-source SADDR is analogous
++      // but not yet exercised here.)
++      INSTR_PIXBLT_LL: rf_wr_data =
++              pblt_wb_saddr    ? pblt_src_addr_q                        // SADDR -> B0
++            : decoded.blt_dst_xy
++                ? {pblt_dst_xy_raw_q[DATA_WIDTH-1:16] + pblt_dy_q,      // DADDR (XY) -> B2
++                   pblt_dst_xy_raw_q[15:0]}
++                : pblt_dst_addr_q;                                      // DADDR (linear) -> B2
+       INSTR_LINE:    rf_wr_data = line_wb_d     ? line_d_q      // d -> B0
+                                : line_wb_daddr  ? line_daddr_q  // DADDR -> B2
+                                                 : line_count_q; // COUNT -> B10
+-- 
+2.53.0.windows.2
+

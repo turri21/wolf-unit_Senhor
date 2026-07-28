@@ -1,0 +1,121 @@
+From 115431904e900a450308e28ebeaeab4b119bcd52 Mon Sep 17 00:00:00 2001
+From: Matt Levine <blahm1d@gmail.com>
+Date: Sun, 5 Jul 2026 09:41:32 -0800
+Subject: [PATCH 05/12] core: P0008 - SUBI/CMPI immediates are
+ one's-complemented
+
+The TMS34010 stores the ONE'S COMPLEMENT of the operand for the subtracting-
+immediate forms SUBI and CMPI, in both the IW (16-bit) and IL (32-bit) forms:
+"CMPI 505h" encodes 0xFAFA, "SUBI 4h" encodes 0xFFFB, "CMPI 10EB4E0h" encodes
+0xFEF14B1F. The ALU does a - b, so the core must feed ~imm32 to compare/subtract
+against the true value. Same encoding-quirk family as P0003 (ANDI); ADDI/ORI/
+XORI/MOVI store the immediate as-is.
+
+Fix: split SUBI_IW/CMPI_IW/SUBI_IL/CMPI_IL out of the shared imm32 arm of the
+alu_b mux and feed ~imm32.
+
+Surfaced by Smash T.V.'s custom-chip self-test (FFF4E570): the VRAM-palette
+readback does CMPI 505h,A3 with A3=0x0505; pre-fix the core compared against
+sign-extended 0xFFFFFAFA -> Z=0 -> wrong branch -> "CUSTOM CHIP U99 BAD". Post-fix
+the whole test returns A0=0 (PASS), matching MAME. Verified across the entire ROM
+via unidasm and vs MAME golden.
+
+---
+ PATCHES.md                | 52 +++++++++++++++++++++++++++++++++++++++
+ rtl/core/tms34010_core.sv | 16 +++++++++---
+ 2 files changed, 64 insertions(+), 4 deletions(-)
+
+diff --git a/PATCHES.md b/PATCHES.md
+index df0ab08..1e54b2c 100644
+--- a/PATCHES.md
++++ b/PATCHES.md
+@@ -236,3 +236,55 @@ and correct (U-number ROM labels).
+ 
+ **Upstream note (P0004-P0007).** All four are real TMS34010 core bugs surfaced by
+ running real game code — offer upstream to birdybro. None is Y-unit-specific.
++
++---
++
++## P0008 — SUBI/CMPI immediate is one's-complemented (CORRECTNESS: every SUBI/CMPI was wrong)
++
++**Status:** ✅ APPLIED + VERIFIED 2026-07-05. `grep -rn P0008 rtl/`.
++
++**Applied edit:** `rtl/core/tms34010_core.sv` (`alu_b` mux) — split the
++subtracting-immediate forms out of the shared `imm32` arm and feed the ALU the
++complement:
++```
++INSTR_SUBI_IW, INSTR_CMPI_IW,
++INSTR_SUBI_IL, INSTR_CMPI_IL: alu_b = ~imm32;   // one's-complement stored imm
++INSTR_MOVI_IW, INSTR_MOVI_IL, INSTR_ADDI_IW, INSTR_ADDI_IL,
++INSTR_ANDI_IL, INSTR_ORI_IL, INSTR_XORI_IL:     alu_b = imm32;   // stored as-is
++```
++
++**Problem.** On the TMS34010 the **subtracting** immediate instructions — `SUBI`
++and `CMPI`, in **both** the IW (16-bit) and IL (32-bit) forms — store the **one's
++complement** of the operand in the immediate field (the ALU forms `a - b` by
++adding the complement + carry). The TI assembler emits `~K`. birdybro's decoder
++fed the raw immediate to `ALU_OP_SUB`/`ALU_OP_CMP`, so `SUBI K` computed
++`Rd - ~K` and `CMPI K` compared against `~K` — **every SUBI/CMPI in every game was
++silently wrong.** (`ADDI`/`ORI`/`XORI`/`MOVI` store the immediate *directly* and
++were already correct; `ANDI`'s complement is handled by `ALU_OP_ANDN`, P0003. This
++is the exact same encoding-quirk family as P0003.)
++
++**Evidence (real ROM + MAME, authoritative).** Verified across the *whole* program
++ROM with `unidasm -arch tms34010` that the immediate word is the one's complement:
++- `CMPI 505h` encodes `0b43 fafa` (`~0x0505 = 0xFAFA`); `CMPI 3h` = `0b40 fffc`;
++  `CMPI 10EB4E0h` (IL) = `0b69 4b1f fef1` (`~0xFEF14B1F`).
++- `SUBI 4h` encodes `0be0 fffb` (`~0x0004 = 0xFFFB`); `SUBI FFE7FD6Dh` (IL) =
++  `0d00 0292 0018` (`~0x00180292`).
++- `ADDI 90h` = `0b0e 0090`, `ORI Ah` = `0ba0 000a 0000`, `XORI 1h` = `0bc0 0001` —
++  all **as-is** (control group; these must NOT complement).
++- **The failure that surfaced it:** the custom-chip self-test (`FFF4E570`) reads
++  back the blitted VRAM palette plane and does `CMPI 505h,A3` with A3=`0x0505`.
++  Pre-fix the core compared `0x0505` against sign-extended `0xFFFFFAFA` → **Z=0**
++  (measured: at `fff4eab0` JRNE, A3=`0x0505` but Z=`0`), so `JRNE` took the fail
++  path → `CUSTOM CHIP U99 BAD`. Post-fix `~imm32 = 0x00000505`, Z=1, the compare
++  passes, and the whole custom-chip test returns A0=0 (PASS), matching MAME
++  (`sim/tb_yunit_custchip.sv`: cmp1 448/448, cmp2 224/224).
++
++**Why boot appeared to "work" before:** like P0003, wrong SUBI/CMPI produced wrong
++*data*/flags, not illegal opcodes, so PC rarely derailed outright — the boot even
++reached the custom-chip test with all setup values matching MAME (the SUBIs on that
++path didn't gate control flow), and only the explicit `CMPI`-against-a-known-constant
++in the self-test exposed it.
++
++**Upstream note.** Real core bug, not Y-unit-specific — offer upstream to birdybro
++together with corrected SUBI/CMPI unit vectors (birdybro's per-instruction TBs pass
++the *un-complemented* immediate, the same blind spot that hid P0003's ANDI).
+diff --git a/rtl/core/tms34010_core.sv b/rtl/core/tms34010_core.sv
+index dde662b..4e14a48 100644
+--- a/rtl/core/tms34010_core.sv
++++ b/rtl/core/tms34010_core.sv
+@@ -1913,14 +1913,22 @@ module tms34010_core
+   end
+   always_comb begin
+     unique case (decoded.iclass)
++      // P0008: TMS34010 stores the ONE'S COMPLEMENT of the immediate for the
++      // subtracting-immediate forms SUBI and CMPI (both IW and IL): "CMPI 505h"
++      // encodes 0xFAFA, "SUBI 4h" encodes 0xFFFB, "CMPI 10EB4E0h" encodes
++      // 0xFEF14B1F. The ALU computes a - b, so feed ~imm32 to subtract/compare
++      // against the true value. ADDI/ORI/XORI/MOVI store the immediate as-is;
++      // ANDI's complement is handled separately by ALU_OP_ANDN (P0003). Verified
++      // against MAME/unidasm across the whole ROM; the custom-chip self-test's
++      // `CMPI 505h` was yielding Z=0 for A3=0x505 (blit readback). See PATCHES.md.
++      INSTR_SUBI_IW,
++      INSTR_CMPI_IW,
++      INSTR_SUBI_IL,
++      INSTR_CMPI_IL: alu_b = ~imm32;
+       INSTR_MOVI_IW,
+       INSTR_MOVI_IL,
+       INSTR_ADDI_IW,
+-      INSTR_SUBI_IW,
+-      INSTR_CMPI_IW,
+       INSTR_ADDI_IL,
+-      INSTR_SUBI_IL,
+-      INSTR_CMPI_IL,
+       INSTR_ANDI_IL,
+       INSTR_ORI_IL,
+       INSTR_XORI_IL: alu_b = imm32;
+-- 
+2.53.0.windows.2
+

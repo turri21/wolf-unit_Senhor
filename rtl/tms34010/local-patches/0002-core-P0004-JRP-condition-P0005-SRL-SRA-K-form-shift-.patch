@@ -1,0 +1,156 @@
+From 0a1c90bd4c6141c705cb8438f93f0bb72f97b245 Mon Sep 17 00:00:00 2001
+From: Matt Levine <blahm1d@gmail.com>
+Date: Sun, 5 Jul 2026 01:04:44 -0800
+Subject: [PATCH 02/12] core: P0004 (JRP condition) + P0005 (SRL/SRA K-form
+ shift amount)
+
+Two more real TMS34010 core bugs found running Smash T.V. attract code (MAME
+golden-reference method). Both documented in PATCHES.md.
+
+- P0004: jump condition code 0001 is P (positive, ~N & ~Z), not CC_LO (st_c).
+  The core mislabeled/evaluated it as unsigned-lower (which is really code 1000
+  = CC_C). Every JRP branched on the wrong flag. Fixed the enum + evaluator +
+  decoder accepted-set. Verified vs MAME (line-draw step sign +1, loop terminates).
+- P0005: SRL/SRA K-form encodes the count as 2's-complement (32-amount); the core
+  passed the raw k5 for the K-form (only the Rs-form was complemented), so
+  "SRL 1Ch" shifted right by 4 instead of 28. Fixed. Verified vs MAME (DYDX
+  assembles to 0x00080006; the draw loop now renders 231 attract objects).
+
+---
+ PATCHES.md                  | 47 +++++++++++++++++++++++++++++++++++++
+ rtl/core/tms34010_core.sv   |  9 ++++++-
+ rtl/core/tms34010_decode.sv |  6 ++---
+ rtl/tms34010_pkg.sv         |  4 +++-
+ 4 files changed, 61 insertions(+), 5 deletions(-)
+
+diff --git a/PATCHES.md b/PATCHES.md
+index 378aa98..76aec8c 100644
+--- a/PATCHES.md
++++ b/PATCHES.md
+@@ -141,3 +141,50 @@ visible by diffing field *stride* against MAME.
+ **Upstream note.** This is a real core bug (not Y-unit-specific) — offer upstream to
+ birdybro along with the corrected `tb_immi_il` vector. Spec: TMS34010 User's Guide,
+ `ANDI` (the immediate is stored complemented). MAME `tms34010` executes the same.
++
++---
++
++## P0004 — JRP condition code mislabeled CC_LO (branches wrong)
++
++**Status:** ✅ APPLIED + VERIFIED 2026-07-05. `grep -rn P0004 rtl/`.
++
++**Applied edits (all in the vendored core):**
++- `rtl/tms34010_pkg.sv`: `CC_LO = 4'b0001` → **`CC_P = 4'b0001`** (comment fixed).
++- `rtl/core/tms34010_core.sv` (branch evaluator): `CC_LO: branch_taken = st_c;`
++  → **`CC_P: branch_taken = !st_n & !st_z;`** (P = positive, ~N & ~Z).
++- `rtl/core/tms34010_decode.sv` (3 accepted-set lists): `CC_LO` → `CC_P`.
++
++**Problem.** TMS34010 jump condition code `0001` is **P (positive: ~N & ~Z)**, but the
++core mapped it to `CC_LO` and evaluated it as `st_c` (unsigned-lower). "Unsigned-lower"
++(borrow) is actually code `1000` = `CC_C`. So every `JRP` branched on the wrong flag.
++
++**Evidence (real ROM + MAME).** Smash T.V. line-draw step-sign (`fff4fa00: JRP`): after
++`CMP A3,A4` (A3=`F028`, A4=`FC30`), flags are N=Z=C=V=0 in **both** MAME and our sim, but
++MAME **takes** the JRP (`P` true) and our core did not (`st_c`=0). Post-fix our core takes
++it too; the line-draw step comes out `+1` (was `-1`), matching MAME, and the boot's
++line-draw loop terminates instead of hanging.
++
++---
++
++## P0005 — SRL/SRA K-form shift by wrong amount (32-K)
++
++**Status:** ✅ APPLIED + VERIFIED 2026-07-05. `grep -rn P0005 rtl/`.
++
++**Applied edit:** `rtl/core/tms34010_core.sv` (`shifter_amount` mux) — add
++`INSTR_SRA_K, INSTR_SRL_K: shifter_amount = (~decoded.k5) + 1;` (2's complement),
++instead of falling through to `default: shifter_amount = decoded.k5;`.
++
++**Problem.** The TMS34010 `SRL`/`SRA` **K-form** encodes its count field as the
++**2's-complement (32-amount)** of the shift amount — e.g. "SRL 1Ch" (right-28) is
++opcode `0x2c85`, raw K-field `0x04` (= 32-28). The `SLL`/`SLA`/`RL` K-forms store the
++amount directly. The core 2's-complemented the *Rs*-form right shifts but passed the raw
++`k5` for the *K*-form, so `SRL K` shifted right by `32-K` (e.g. `>>28` became `>>4`).
++
++**Evidence (real ROM + MAME).** Smash T.V. sprite DYDX assembly: `SLL 1Ch,A5` →
++`0x80000000`, then `SRL 1Ch,A5`: MAME `>>28` = `0x8`, our core `>>4` = `0x08000000`.
++Post-fix `SRL 1Ch` gives `0x8` and DYDX assembles to `0x00080006` (matching MAME); the
++draw loop then renders 231 attract objects (was 1) via PIXBLT.
++
++**Upstream note (P0004+P0005).** Both are real TMS34010 core bugs — offer upstream to
++birdybro. Neither is Y-unit-specific; they only surfaced running real game code (the
++per-instruction unit TBs didn't exercise `JRP`-after-`CMP` or the `SRL` K-form encoding).
+diff --git a/rtl/core/tms34010_core.sv b/rtl/core/tms34010_core.sv
+index 4fd428b..3e8cb4a 100644
+--- a/rtl/core/tms34010_core.sv
++++ b/rtl/core/tms34010_core.sv
+@@ -2021,7 +2021,7 @@ module tms34010_core
+   always_comb begin
+     unique case (decoded.branch_cc)
+       CC_UC:   branch_taken = 1'b1;
+-      CC_LO:   branch_taken = st_c;                   // unsigned <
++      CC_P:    branch_taken = !st_n & !st_z;           // P0004: P = positive (>0), ~N & ~Z
+       CC_LS:   branch_taken = st_c | st_z;             // unsigned <=
+       CC_HI:   branch_taken = !st_c & !st_z;           // unsigned >
+       CC_LT:   branch_taken = st_n ^ st_v;             // signed   <
+@@ -2329,6 +2329,13 @@ module tms34010_core
+       INSTR_SRA_RR,
+       INSTR_SRL_RR: shifter_amount = (~rf_rs1_data[SHIFT_AMOUNT_WIDTH-1:0])
+                                      + {{(SHIFT_AMOUNT_WIDTH-1){1'b0}}, 1'b1};
++      // P0005: the SRL/SRA K-form encodes its count as (32 - amount) — the raw
++      // 5-bit field is the 2's complement of the shift amount (e.g. "SRL 1Ch"
++      // = shift-right-28 = field 0x04). The SLL/SLA/RL K-forms store the amount
++      // directly. So right-shift-by-constant must 2's-complement k5, mirroring
++      // the Rs-form above. (Was: default -> k5, which shifted right by 32-K.)
++      INSTR_SRA_K,
++      INSTR_SRL_K:  shifter_amount = (~decoded.k5) + {{(SHIFT_AMOUNT_WIDTH-1){1'b0}}, 1'b1};
+       default:      shifter_amount = decoded.k5;
+     endcase
+   end
+diff --git a/rtl/core/tms34010_decode.sv b/rtl/core/tms34010_decode.sv
+index 2d15ed7..970e0ac 100644
+--- a/rtl/core/tms34010_decode.sv
++++ b/rtl/core/tms34010_decode.sv
+@@ -2018,7 +2018,7 @@ module tms34010_decode
+     if (instr[15:12] == JRCC_TOP4 &&
+         instr[7:0] != 8'h00 && instr[7:0] != 8'h80 &&
+         (instr[11:8] == CC_UC ||
+-         instr[11:8] == CC_LO ||
++         instr[11:8] == CC_P  ||
+          instr[11:8] == CC_LS ||
+          instr[11:8] == CC_HI ||
+          instr[11:8] == CC_LT ||
+@@ -2062,7 +2062,7 @@ module tms34010_decode
+     if (instr[15:12] == JRCC_TOP4 &&
+         instr[7:0] == 8'h00 &&
+         (instr[11:8] == CC_UC ||
+-         instr[11:8] == CC_LO ||
++         instr[11:8] == CC_P  ||
+          instr[11:8] == CC_LS ||
+          instr[11:8] == CC_HI ||
+          instr[11:8] == CC_LT ||
+@@ -2267,7 +2267,7 @@ module tms34010_decode
+     if (instr[15:12] == JRCC_TOP4 &&
+         instr[7:0] == 8'h80 &&
+         (instr[11:8] == CC_UC ||
+-         instr[11:8] == CC_LO ||
++         instr[11:8] == CC_P  ||
+          instr[11:8] == CC_LS ||
+          instr[11:8] == CC_HI ||
+          instr[11:8] == CC_LT ||
+diff --git a/rtl/tms34010_pkg.sv b/rtl/tms34010_pkg.sv
+index 7a85b94..e0dd9f5 100644
+--- a/rtl/tms34010_pkg.sv
++++ b/rtl/tms34010_pkg.sv
+@@ -575,7 +575,9 @@ package tms34010_pkg;
+   // guess of EQ=0100 and NE=0111 was WRONG — those codes are actually
+   // LT and GT, respectively. Corrected in Task 0030; see A0023.
+   parameter logic [3:0] CC_UC = 4'b0000;  // unconditional
+-  parameter logic [3:0] CC_LO = 4'b0001;  // lower-than       (unsigned; C = 1; alias "B")
++  parameter logic [3:0] CC_P  = 4'b0001;  // P: positive/>0   (~N & ~Z)  [P0004: was mislabeled
++                                           // CC_LO=st_c. TMS34010 code 0001 is P (JRP), not
++                                           // unsigned-lower — that is code 1000 = CC_C (borrow).]
+   parameter logic [3:0] CC_LS = 4'b0010;  // lower-or-same    (unsigned; C | Z = 1)
+   parameter logic [3:0] CC_HI = 4'b0011;  // higher-than      (unsigned; ~C & ~Z = 1)
+   parameter logic [3:0] CC_LT = 4'b0100;  // less-than        (signed;   N ^ V = 1)
+-- 
+2.53.0.windows.2
+

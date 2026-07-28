@@ -1,0 +1,159 @@
+From 25fa34ba15bec5c56389f4ceaddfd3d749f0b608 Mon Sep 17 00:00:00 2001
+From: Matt Levine <blahm1d@gmail.com>
+Date: Sun, 5 Jul 2026 13:33:07 -0800
+Subject: [PATCH 09/12] core: P0013 - don't abort an in-flight fetch when an
+ interrupt arrives
+
+CORE_FETCH diverts to the interrupt-entry sequence combinationally whenever
+int_take is high. If int_take rises AFTER the fetch request was already
+latched by the memory system (e.g. the display interrupt firing mid-fetch,
+now possible since P0012 made INTPEND.DI async to the CPU), the core
+abandons the fetch and jumps to CORE_INT_PUSH_PC. The memsys's ack for the
+aborted read then lands while the core drives the return-PC write, so the
+core mistakes the read-ack for its write-ack -> the PC push is never
+committed. The return-PC stack slot keeps its old value (0), the ST push
+commits fine, and RETI later returns to 0 -> derail into VRAM after ~18
+frames.
+
+Fix: track fetch_inflight_q (CORE_FETCH holds mem_req, no ack yet) and gate
+the interrupt divert on !fetch_inflight_q. An in-flight fetch now completes;
+the interrupt is taken at the next fetch boundary (HW-correct). Post-fix the
+boot runs the interrupt-driven main loop with no derail through 6M cycles;
+frame-advances track render-calls 1:1 (was 6084 vs 18). MM unit TBs pass.
+
+Also clarifies the INT_VEC_* comments (values unchanged; verified against
+MAME check_interrupt: DI=0xFFFFFEA0, HI=0xFFFFFEC0, WV=0xFFFFFE80).
+
+---
+ PATCHES.md                | 47 +++++++++++++++++++++++++++++++++++++++
+ rtl/core/tms34010_core.sv | 23 ++++++++++++++++++-
+ rtl/tms34010_pkg.sv       | 14 +++++++-----
+ 3 files changed, 78 insertions(+), 6 deletions(-)
+
+diff --git a/PATCHES.md b/PATCHES.md
+index e851a99..9fd9a56 100644
+--- a/PATCHES.md
++++ b/PATCHES.md
+@@ -406,6 +406,53 @@ word for push and pop, the exact blind spot that hid this — same family as P00
+ 
+ ---
+ 
++## P0013 — an interrupt taken mid-fetch aborts the fetch → dropped PC push → RETI derail
++
++**Status:** ✅ APPLIED + VERIFIED 2026-07-05. `grep -rn P0013 rtl/`.
++
++**Applied edits (`rtl/core/tms34010_core.sv`):**
++- New `fetch_inflight_q` register: set while `CORE_FETCH` holds `mem_req` with no ack,
++  cleared on `mem_ack` or on leaving `CORE_FETCH`.
++- `CORE_FETCH` interrupt gate: `if (int_take)` → `if (int_take && !fetch_inflight_q)`.
++- (`rtl/tms34010_pkg.sv`: only the INT_VEC_* comments were clarified — the vector
++  VALUES were already correct; see the false start below.)
++
++**Problem.** `CORE_FETCH` asserts `mem_req` for the instruction fetch and, combinationally
++each cycle, diverts to the interrupt-entry sequence if `int_take` is high. If `int_take`
++rises AFTER the fetch request was already latched by the memory system (e.g. the display
++interrupt firing mid-fetch — newly possible once **P0012** made `INTPEND.DI` asynchronous
++to the CPU), the core abandons the fetch and jumps to `CORE_INT_PUSH_PC`. But the memsys
++is still finishing the aborted read; its `mem_ack` then lands while the core is in
++`CORE_INT_PUSH_PC` driving the return-PC WRITE, so the core mistakes the read-ack for its
++write-ack and advances to `CORE_INT_PUSH_ST` — **the PC push is never latched/committed by
++the memsys.** The return-PC stack slot keeps its old value (0), the ST push (next word)
++commits fine, and `RETI` later returns to `0x00000000` → derail into VRAM.
++
++**Evidence (cycle trace, `sim/tb_yunit_intstate.sv`).** At the derailing interrupt:
++`cyc N` CORE_FETCH issues `mem_req` (read `ffe02090`); `cyc N+1` DI pends → `int_take`↑ →
++abort to PUSH_PC; `cyc N+2` PUSH_PC drives `@010fff90 <= ffe02090` and sees `ack=1` in the
++SAME cycle (that ack is the aborted read's), but `ram[FFF9]` stays `0000`; the following
++PUSH_ST (`@010fff70 <= ST`) commits normally (RETI reads ST back correctly). A different
++interrupt with the identical SP0 but no mid-fetch collision pushed + returned fine — same
++address, different outcome, i.e. a handshake race, not addressing. Post-fix: the in-flight
++fetch completes, the instruction executes, the interrupt is taken at the next boundary
++(HW-correct), the PC push commits, and the boot runs the interrupt-driven main loop with
++**NO derail through 6M cycles** — frame-advances (114) now track render-calls (114) 1:1
++(was 6084 vs 18), ~one display interrupt per frame.
++
++**False start (recorded so nobody repeats it):** the derail first *looked* like a wrong DI
++vector — the DI vectors to `0xFFFFFEA0`, which I assumed "should" be `0xFFFFFF00" per a
++mis-remembered vector map. Changing it hid the derail (routed DI to a benign short handler)
++but was WRONG. **MAME `tms34010.cpp check_interrupt()` is authoritative: HI=0xFFFFFEC0,
++DI=0xFFFFFEA0, WV=0xFFFFFE80, INT1=0xFFFFFFC0, INT2=0xFFFFFFA0, NMI=0xFFFFFEE0** — exactly
++the core's original constants. Reverted; the real bug was the fetch-abort handshake above.
++
++**Upstream note.** Real core bug, not Y-unit-specific — any interrupt that becomes pending
++while a fetch is outstanding hits it. birdybro's per-instruction TBs never drove an async
++interrupt during a fetch, so it stayed hidden until a real game (P0012) did. Offer upstream.
++
++---
++
+ ## P0012 — wire the display-interrupt source (INTEGRATION, was upstream Task 0097)
+ 
+ **Status:** ✅ APPLIED 2026-07-05 (integration, not a bug fix). `grep -rn P0012 rtl/`.
+diff --git a/rtl/core/tms34010_core.sv b/rtl/core/tms34010_core.sv
+index 5f4abe2..b8b700d 100644
+--- a/rtl/core/tms34010_core.sv
++++ b/rtl/core/tms34010_core.sv
+@@ -2293,6 +2293,25 @@ module tms34010_core
+   logic int_take;
+   assign int_take = nmi_req || int_req;
+ 
++  // P0013: a fetch request the memory system has already latched MUST run to
++  // completion before we honour an interrupt. Otherwise, if int_take rises after
++  // mem_req was asserted (e.g. the display interrupt firing mid-fetch — possible
++  // once P0012 made INTPEND.DI async to the CPU), the core would abort the fetch
++  // and jump to CORE_INT_PUSH_PC; the memsys's ack for the aborted fetch then
++  // gets misattributed to the interrupt's PC push, so that 32-bit write is
++  // silently dropped and RETI returns to a corrupt (0) address → derail. Once a
++  // fetch is in flight, ignore int_take until mem_ack; the interrupt is taken at
++  // the next fetch boundary — HW-correct (the in-flight instruction completes).
++  logic fetch_inflight_q;
++  always_ff @(posedge clk) begin
++    if (rst)
++      fetch_inflight_q <= 1'b0;
++    else if (state_q == CORE_FETCH && mem_req && !mem_ack)
++      fetch_inflight_q <= 1'b1;
++    else if (mem_ack || state_q != CORE_FETCH)
++      fetch_inflight_q <= 1'b0;
++  end
++
+   // Latched state for the entry sequence (captured when leaving CORE_FETCH):
+   //   int_vec_q    — the trap-vector address to fetch.
+   //   int_is_nmi_q — this entry is an NMI (drives the auto-clear).
+@@ -2526,7 +2545,9 @@ module tms34010_core
+         // enabled INTPEND bit). When taken, do NOT fetch — pc_value stays at the
+         // resume address. An NMI with NMIM=1 saves no context and jumps
+         // straight to the vector; everything else pushes PC+ST first.
+-        if (int_take) begin
++        // P0013: gate on !fetch_inflight_q so an interrupt that arrives after the
++        // fetch request was already latched doesn't abort it (see fetch_inflight_q).
++        if (int_take && !fetch_inflight_q) begin
+           state_d = (nmi_req && nmi_nmim) ? CORE_INT_VECTOR : CORE_INT_PUSH_PC;
+         end else begin
+           mem_req  = 1'b1;
+diff --git a/rtl/tms34010_pkg.sv b/rtl/tms34010_pkg.sv
+index e0dd9f5..6a92043 100644
+--- a/rtl/tms34010_pkg.sv
++++ b/rtl/tms34010_pkg.sv
+@@ -319,11 +319,15 @@ package tms34010_pkg;
+   parameter int unsigned INT_HI_BIT = 9;   // host interrupt
+   parameter int unsigned INT_DI_BIT = 10;  // display interrupt
+   parameter int unsigned INT_WV_BIT = 11;  // window violation
+-  parameter logic [ADDR_WIDTH-1:0] INT_VEC_X1 = 32'hFFFF_FFC0; // trap 1
+-  parameter logic [ADDR_WIDTH-1:0] INT_VEC_X2 = 32'hFFFF_FFA0; // trap 2
+-  parameter logic [ADDR_WIDTH-1:0] INT_VEC_HI = 32'hFFFF_FEC0; // trap 9
+-  parameter logic [ADDR_WIDTH-1:0] INT_VEC_DI = 32'hFFFF_FEA0; // trap 10
+-  parameter logic [ADDR_WIDTH-1:0] INT_VEC_WV = 32'hFFFF_FE80; // trap 11
++  // Internal-interrupt vectors. VERIFIED against MAME tms34010.cpp check_interrupt():
++  // HI=0xFFFFFEC0, DI=0xFFFFFEA0, WV=0xFFFFFE80, INT1=0xFFFFFFC0, INT2=0xFFFFFFA0,
++  // NMI=0xFFFFFEE0. (These are the real device vectors — the display interrupt does
++  // vector to 0xFFFFFEA0, i.e. Smash T.V.'s DI handler is at ROM ffe0def0.)
++  parameter logic [ADDR_WIDTH-1:0] INT_VEC_X1 = 32'hFFFF_FFC0; // INT1 (external 1)
++  parameter logic [ADDR_WIDTH-1:0] INT_VEC_X2 = 32'hFFFF_FFA0; // INT2 (external 2)
++  parameter logic [ADDR_WIDTH-1:0] INT_VEC_HI = 32'hFFFF_FEC0; // host interrupt
++  parameter logic [ADDR_WIDTH-1:0] INT_VEC_DI = 32'hFFFF_FEA0; // display interrupt
++  parameter logic [ADDR_WIDTH-1:0] INT_VEC_WV = 32'hFFFF_FE80; // window violation
+ 
+   // Nonmaskable interrupt (NMI): host sets HSTCTLH.NMI; the device vectors
+   // through trap 8 and (if NMIM=0) pushes PC+ST. 1988 UG §8 (Table 8-2,
+-- 
+2.53.0.windows.2
+

@@ -1,0 +1,249 @@
+From 849a463b666df2fa923533f0af81c636639c14f5 Mon Sep 17 00:00:00 2001
+From: Matt Levine <blahm1d@gmail.com>
+Date: Sat, 4 Jul 2026 14:52:34 -0800
+Subject: [PATCH 10/12] core: P0014 - implement MOVE @SAddr,@DAddr (mem-to-mem
+ absolute field move)
+
+The TMS34010 MOVE @SAddr,@DAddr (0x05C0/0x0DC0, both operands absolute
+32-bit addresses, 5-word encoding) was never decoded -- birdybro had the
+register-indirect M2M and single-address abs load/store, but not abs-to-abs.
+
+Wiring real inputs (Phase 4) put the game on its true attract path, where
+the display-interrupt handler uses it for per-frame palette work
+(MOVE @1086210h,@18103D0h at ffe0e480, mainram->palette). With inputs
+stubbed to 0 the boot ran clean; with real inputs it hit 0x05C0 as an
+illegal opcode.
+
+Fix: new iclass INSTR_MOVE_ABS_M2M + CORE_FETCH_IMM2_LO/HI states + a
+second immediate (imm2_lo/hi -> imm2_32 = DAddr); a two-step CORE_MEMORY
+transaction (step 0 reads the mv_fs field at imm32=SAddr into move_data_q,
+step 1 writes it to imm2_32=DAddr), modelled on INSTR_MOVE_FIELD_M2M.
+Post-fix the boot runs the main loop with no illegal opcode. MM TBs pass.
+
+---
+ PATCHES.md                  | 38 ++++++++++++++++++++++
+ rtl/core/tms34010_core.sv   | 63 +++++++++++++++++++++++++++++++++++--
+ rtl/core/tms34010_decode.sv | 15 +++++++++
+ rtl/tms34010_pkg.sv         |  9 ++++--
+ 4 files changed, 121 insertions(+), 4 deletions(-)
+
+diff --git a/PATCHES.md b/PATCHES.md
+index 9fd9a56..024c814 100644
+--- a/PATCHES.md
++++ b/PATCHES.md
+@@ -498,3 +498,41 @@ handler epilogue at `ffe0ef80` (`MMFM SP,A0-A14`; `MMFM SP,B0-B5`; `RETI` @`ffe0
+ is the very first time a real game drives the core's interrupt path). NEXT: MAME-diff
+ the push/RETI stack layout for this handler (dump the words RETI pops as ST/PC vs
+ MAME); check push order (PC then ST) and the RETI SP arithmetic against the UG.
++
++---
++
++## P0014 — MOVE @SAddr,@DAddr (memory-to-memory absolute field move) not implemented
++
++**Status:** ✅ APPLIED + VERIFIED 2026-07-05. `grep -rn P0014 rtl/`.
++
++**Applied edits:**
++- `rtl/tms34010_pkg.sv`: new iclass `INSTR_MOVE_ABS_M2M = 7'd99`; new FSM states
++  `CORE_FETCH_IMM2_LO = 6'd39` / `CORE_FETCH_IMM2_HI = 6'd40`.
++- `rtl/core/tms34010_decode.sv`: decode `0x05C0`/`0x0DC0` (SETF field-op family,
++  `instr[8]` set, sub-op `instr[7:5] == 110`) → `INSTR_MOVE_ABS_M2M`, `needs_imm32`
++  (fetch SAddr) + `needs_memory_op`, no register writeback, flags Unaffected.
++- `rtl/core/tms34010_core.sv`: second-immediate registers `imm2_lo_q`/`imm2_hi_q`
++  (+ `imm2_32`); after `CORE_FETCH_IMM_HI` route ABS_M2M to `CORE_FETCH_IMM2_LO` →
++  `CORE_FETCH_IMM2_HI` → `CORE_EXECUTE`; a two-step CORE_MEMORY transaction (step 0
++  reads the `mv_fs`-bit field at `imm32`=SAddr into `move_data_q`, step 1 writes it to
++  `imm2_32`=DAddr) modelled on `INSTR_MOVE_FIELD_M2M`.
++
++**Problem.** The TMS34010 `MOVE @SAddr,@DAddr` (both operands absolute 32-bit
++addresses) was never decoded — the core had the register-indirect M2M and the
++single-address abs load/store, but not abs-to-abs. Its 5-word encoding is opcode +
++SAddr(2) + DAddr(2). birdybro's 122-instruction set omitted it; the boot never hit it
++until real inputs (Phase 4) put the game on its true attract path, where the
++**display-interrupt handler** uses it for per-frame palette work
++(`MOVE @1086210h,@18103D0h` at `ffe0e480` — a mainram→palette copy).
++
++**Evidence.** With inputs stubbed to 0 the boot ran clean (degenerate state); wiring
++real inputs (idle = active-low 0xFFFF, correct DSW) sent the DI handler down the
++`CMPI 9Ah`/`JRNE` branch to `ffe0e480`, where the core hit `0x05C0` as an illegal
++opcode (`sim/tb_yunit_inputs.sv`, first-illegal @pc=`ffe0e490`… the M2M spans two
++words). `unidasm` decodes it as `MOVE @1086210h,@18103D0h`. Post-fix the instruction
++executes, the boot runs the interrupt-driven main loop with **no illegal opcode**
++(final pc=`ffe0a2e0`, the main loop). MM unit TBs (`tb_mmtm`/`mmfm`/`mmtm_nflag`) still PASS.
++
++**Upstream note.** A real missing TMS34010 instruction, not Y-unit-specific — offer
++upstream to birdybro. (The XY-address and F=1 variants share the datapath; F is honoured
++via `mv_fs`. Only the abs-to-abs *linear* form is exercised so far.)
+diff --git a/rtl/core/tms34010_core.sv b/rtl/core/tms34010_core.sv
+index b8b700d..55789b6 100644
+--- a/rtl/core/tms34010_core.sv
++++ b/rtl/core/tms34010_core.sv
+@@ -238,6 +238,12 @@ module tms34010_core
+   // CORE_FETCH_IMM_LO / CORE_FETCH_IMM_HI).
+   instr_word_t imm_lo_q;
+   instr_word_t imm_hi_q;
++  // P0014: second 32-bit immediate (the DAddr of MOVE @SAddr,@DAddr). SAddr
++  // reuses imm_lo_q/imm_hi_q; DAddr is fetched into these after it.
++  instr_word_t imm2_lo_q;
++  instr_word_t imm2_hi_q;
++  wire [DATA_WIDTH-1:0] imm2_32 = {imm2_hi_q, imm2_lo_q};
++  wire is_mv_abs_m2m = (decoded.iclass == INSTR_MOVE_ABS_M2M);
+ 
+   // Long-form JRcc target: PC_after_both_fetches + sign_extend(disp16) × 16.
+   // By the time the FSM hits CORE_WRITEBACK, pc_value already equals
+@@ -308,6 +314,10 @@ module tms34010_core
+       if (decoded.iclass == INSTR_MOVE_FIELD_M2M && mem_op_step == 2'd0) begin
+         move_data_q <= mem_rdata_eff;
+       end
++      // P0014: MOVE @,@ step 0 latches the source field for the step-1 write.
++      if (decoded.iclass == INSTR_MOVE_ABS_M2M && mem_op_step == 2'd0) begin
++        move_data_q <= mem_rdata_eff;
++      end
+       // PIXT store plane-mask RMW: step 0 reads the destination pixel; latch
+       // it so step 1 can merge it under the plane mask.
+       if (decoded.iclass == INSTR_MOVE_FIELD_STORE && pixt_rmw && mem_op_step == 2'd0) begin
+@@ -335,7 +345,8 @@ module tms34010_core
+         INSTR_TRAP: mem_op_step <= (trap_skip_push || mem_op_step == 2'd2)
+                                  ? 2'd0
+                                  : mem_op_step + 2'd1;
+-        INSTR_MOVE_FIELD_M2M:
++        INSTR_MOVE_FIELD_M2M,
++        INSTR_MOVE_ABS_M2M:                              // P0014
+                     mem_op_step <= (mem_op_step == 2'd1) ? 2'd0 : mem_op_step + 2'd1;
+         // PIXT store RMW: step 0 (read) -> step 1 (write) -> 0. Regular MOVE
+         // store (no force_pixel) is single-step and falls through to default.
+@@ -1077,6 +1088,13 @@ module tms34010_core
+       if (state_q == CORE_FETCH_IMM_HI && mem_ack) begin
+         imm_hi_q <= mem_rdata_eff[INSTR_WORD_WIDTH-1:0];
+       end
++      // P0014: DAddr of MOVE @,@ (fetched after SAddr).
++      if (state_q == CORE_FETCH_IMM2_LO && mem_ack) begin
++        imm2_lo_q <= mem_rdata_eff[INSTR_WORD_WIDTH-1:0];
++      end
++      if (state_q == CORE_FETCH_IMM2_HI && mem_ack) begin
++        imm2_hi_q <= mem_rdata_eff[INSTR_WORD_WIDTH-1:0];
++      end
+     end
+   end
+ 
+@@ -2625,6 +2643,30 @@ module tms34010_core
+       end
+ 
+       CORE_FETCH_IMM_HI: begin
++        mem_req  = 1'b1;
++        mem_we_int   = 1'b0;
++        mem_addr = pc_value;
++        mem_size = INSTR_WORD_BITS;
++        if (mem_ack) begin
++          pc_advance_en = 1'b1;
++          // P0014: MOVE @,@ needs a second absolute address (DAddr) after SAddr.
++          state_d = is_mv_abs_m2m ? CORE_FETCH_IMM2_LO : CORE_EXECUTE;
++        end
++      end
++
++      // P0014: fetch the DAddr (second 32-bit immediate) of MOVE @SAddr,@DAddr.
++      CORE_FETCH_IMM2_LO: begin
++        mem_req  = 1'b1;
++        mem_we_int   = 1'b0;
++        mem_addr = pc_value;
++        mem_size = INSTR_WORD_BITS;
++        if (mem_ack) begin
++          pc_advance_en = 1'b1;
++          state_d = CORE_FETCH_IMM2_HI;
++        end
++      end
++
++      CORE_FETCH_IMM2_HI: begin
+         mem_req  = 1'b1;
+         mem_we_int   = 1'b0;
+         mem_addr = pc_value;
+@@ -3076,6 +3118,22 @@ module tms34010_core
+               mem_wdata = move_data_q;     // field (low FS bits) read in step 0
+             end
+           end
++          INSTR_MOVE_ABS_M2M: begin
++            // P0014: two-step absolute mem->mem. Step 0 reads an FS-bit field
++            // at SAddr (imm32) into move_data_q; step 1 writes it to DAddr
++            // (imm2_32). FS from the F-selected ST pair (mv_fs). No FE
++            // extension (mem->mem), no register/pointer writeback, flags Unaff.
++            mem_req   = 1'b1;
++            mem_size  = mv_fs;
++            if (mem_op_step == 2'd0) begin
++              mem_we_int = 1'b0;
++              mem_addr   = imm32;          // SAddr
++            end else begin
++              mem_we_int = 1'b1;
++              mem_addr   = imm2_32;        // DAddr
++              mem_wdata  = move_data_q;    // field (low FS bits) read in step 0
++            end
++          end
+           default: ;  // no transaction (shouldn't reach with needs_memory_op=0)
+         endcase
+         if (mem_ack) begin
+@@ -3087,7 +3145,8 @@ module tms34010_core
+                           state_d = CORE_WRITEBACK;
+             INSTR_MMTM,
+             INSTR_MMFM: if (mm_mask_will_be_empty) state_d = CORE_WRITEBACK;
+-            INSTR_MOVE_FIELD_M2M: if (mem_op_step == 2'd1) state_d = CORE_WRITEBACK;
++            INSTR_MOVE_FIELD_M2M,
++            INSTR_MOVE_ABS_M2M:   if (mem_op_step == 2'd1) state_d = CORE_WRITEBACK; // P0014
+             // PIXT store RMW stays for its write step; single-step store exits.
+             INSTR_MOVE_FIELD_STORE:
+                         if (!pixt_rmw || mem_op_step == 2'd1) state_d = CORE_WRITEBACK;
+diff --git a/rtl/core/tms34010_decode.sv b/rtl/core/tms34010_decode.sv
+index b30ffa5..9bcc1d4 100644
+--- a/rtl/core/tms34010_decode.sv
++++ b/rtl/core/tms34010_decode.sv
+@@ -1383,6 +1383,21 @@ module tms34010_decode
+       decoded.wb_flag_mask    = '{n: 1'b1, c: 1'b0, z: 1'b1, v: 1'b1};
+     end
+ 
++    // 110 = MOVE @SAddr,@DAddr (memory-to-memory, both absolute) — P0014.
++    // 0x05C0 (F=0)/0x0DC0 (F=1). Reads an FS-bit field at the first absolute
++    // address (imm32 = SAddr) and writes it to the second (imm2_32 = DAddr).
++    // needs_imm32 fetches SAddr (imm_lo/hi); the core FSM fetches DAddr
++    // (imm2_lo/hi) after it because the iclass is MOVE_ABS_M2M. No register
++    // operand, no register writeback, all flags Unaffected (mem->mem, like store).
++    if (instr[15:10] == SETF_TOP6 && instr[8] && (instr[7:5] == 3'b110)) begin
++      decoded.illegal         = 1'b0;
++      decoded.iclass          = INSTR_MOVE_ABS_M2M;
++      decoded.needs_imm32     = 1'b1;                  // fetch SAddr (first 32b)
++      decoded.needs_memory_op = 1'b1;
++      decoded.wb_reg_en       = 1'b0;                  // no register writeback
++      decoded.wb_flags_en     = 1'b0;                  // all flags Unaffected
++    end
++
+     // -----------------------------------------------------------------------
+     // MOVB (move byte, FS forced to 8) — Task 0080. Seven forms reuse the
+     // MOVE field/offset/absolute datapaths with decoded.force_byte = 1, which
+diff --git a/rtl/tms34010_pkg.sv b/rtl/tms34010_pkg.sv
+index 6a92043..fb4c075 100644
+--- a/rtl/tms34010_pkg.sv
++++ b/rtl/tms34010_pkg.sv
+@@ -101,7 +101,9 @@ package tms34010_pkg;
+     CORE_LINE_WB_COUNT  = 6'd35, // LINE: write back COUNT (=0) -> B10
+     CORE_LINE_SETUP_WIN = 6'd36, // LINE (W=3): read WSTART/WEND for per-pixel clip
+     CORE_PIXT_SETUP_WIN = 6'd37, // PIXT XY (W!=0): read WSTART/WEND before the RMW
+-    CORE_RESET_VEC      = 6'd38  // P0001 (Arcade-SmashTV): reset -> read PC from vector 0xFFFFFFE0
++    CORE_RESET_VEC      = 6'd38, // P0001 (Arcade-SmashTV): reset -> read PC from vector 0xFFFFFFE0
++    CORE_FETCH_IMM2_LO  = 6'd39, // P0014: MOVE @,@ — fetch DAddr low word (after SAddr in imm_*)
++    CORE_FETCH_IMM2_HI  = 6'd40  // P0014: MOVE @,@ — fetch DAddr high word
+   } core_state_t;
+ 
+   // ---------------------------------------------------------------------------
+@@ -567,9 +569,12 @@ package tms34010_pkg;
+     INSTR_DRAV             = 7'd97, // DRAV Rs,Rd — draw COLOR1 at Rd's XY (PSIZE pixel, with
+                               //                     PPOP/T/PMASK), then Rd += Rs as an XY add
+                               //                     (no carry X->Y). Encoding 0xF600.
+-    INSTR_LINE             = 7'd98  // LINE Z — Bresenham inner loop: draw COUNT pixels of
++    INSTR_LINE             = 7'd98, // LINE Z — Bresenham inner loop: draw COUNT pixels of
+                               //                     COLOR1 along a line. B-file: d/DADDR/DYDX
+                               //                     (b:a)/COUNT/INC1/INC2. Enc 0xDF1A/0xDF9A.
++    INSTR_MOVE_ABS_M2M     = 7'd99  // MOVE @SAddr,@DAddr — field at mem[SAddr] -> mem[DAddr],
++                              //                     both absolute (32-bit each). Enc 0x05C0 (F=0)/
++                              //                     0x0DC0 (F=1). P0014: 4 imm words, read-then-write.
+   } instr_class_t;
+ 
+   // Condition codes used by JRcc / JAcc (and other conditional ops).
+-- 
+2.53.0.windows.2
+

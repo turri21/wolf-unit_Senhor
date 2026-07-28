@@ -1,0 +1,27 @@
+# Arcade-SmashTV source list (sourced by Arcade-SmashTV.qsf).
+# NOTE: run quartus/build_sv2v.sh FIRST — it down-converts the SystemVerilog core
+# (TMS34010 + yunit_*) to Quartus-friendly Verilog at build_syn/smashtv_core.v.
+
+# --- SDC (SDRAM I/O timing; sys/ provides sys_top.sdc + derive_pll_clocks) ---
+set_global_assignment -name SDC_FILE rtl/sdram.sdc
+
+# --- emu wrapper (Quartus-native SystemVerilog; instantiates yunit_top by name) ---
+set_global_assignment -name SYSTEMVERILOG_FILE Arcade-SmashTV.sv
+
+# --- USE_DDR3_GFX only: gfx ROM download interleave transform (plain comb SV, no sv2v needed) ---
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/wolf/wolf_gfx_interleave.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/wolf/wolf_gfxdl_fifo.sv
+
+# --- the sv2v'd core blob (yunit_top + TMS34010 + all yunit_* + sdram) ---
+set_global_assignment -name VERILOG_FILE build_syn/smashtv_core.v
+
+# --- PLL (edited to 3 outputs: clk_sys 96 / clk_sdram 96-shift / clk_snd 12) ---
+set_global_assignment -name QIP_FILE rtl/pll.qip
+
+# --- Williams CVSD sound board (VHDL + Verilog; NOT sv2v'd) + jt51 YM2151 ---
+set_global_assignment -name VHDL_FILE rtl/sound/williams_cvsd/gen_ram.vhd
+set_global_assignment -name VHDL_FILE rtl/sound/williams_cvsd/hc55564.vhd
+set_global_assignment -name VHDL_FILE rtl/sound/williams_cvsd/pia6821.vhd
+set_global_assignment -name VHDL_FILE rtl/sound/williams_cvsd/williams_cvsd_board.vhd
+set_global_assignment -name VERILOG_FILE rtl/sound/williams_cvsd/mc6809is.v
+set_global_assignment -name QIP_FILE rtl/sound/jt51/hdl/jt51.qip

@@ -1,0 +1,162 @@
+From d14bab8cfaae34fa9541e5bfa2eb19d505790892 Mon Sep 17 00:00:00 2001
+From: Matt Levine <blahm1d@gmail.com>
+Date: Sat, 4 Jul 2026 19:01:07 -0800
+Subject: [PATCH 12/12] core: P0016 - wire the external LINT1 pin (DMA-done ->
+ blit-queue pump)
+
+The Y-unit game's per-frame drawing is a blit QUEUE pumped by the INT1
+ISR (vector -> ffe00000): the ISR feeds one blit to the DMA engine;
+blit completion asserts LINT1 in hardware (MAME dma_callback:
+set_input_line(0, ASSERT_LINE)); any DMA COMMAND write clears it
+(dma_w: CLEAR_LINE). Without the pin, the title task submitted exactly
+ONE blit (the top strip of the version-info rectangle, confirmed by the
+cabinet owner) and yielded forever -- pixel-static screen through 400+
+frames while everything else (scheduler, inputs, coin credit) ran fine.
+
+Fix: new core input `lint1_in`, mirrored into INTPEND.X1P by io_regs
+per the UG (X1P reflects the pin; not clearable via INTPEND writes).
+The mirror uses (lint1_in === 1'b1) so ~99 legacy core TBs with the
+port unconnected keep working unchanged.
+
+VERIFIED (32M-cycle integrated run): blit pump runs, screens advance,
+coin -> credit, START -> game state 0x30->0x10->0x18, and the post-
+START frame shows REAL GAMEPLAY (player sprite, HUD panels, icons
+matching MAME's arena). No illegal opcodes; all regression TBs PASS.
+
+---
+ PATCHES.md                 | 47 ++++++++++++++++++++++++++++++++++++++
+ rtl/core/tms34010_core.sv  | 10 ++++++--
+ rtl/io/tms34010_io_regs.sv | 20 +++++++++++++---
+ 3 files changed, 72 insertions(+), 5 deletions(-)
+
+diff --git a/PATCHES.md b/PATCHES.md
+index 1f181df..7c60463 100644
+--- a/PATCHES.md
++++ b/PATCHES.md
+@@ -570,3 +570,50 @@ to complete (no illegal) and post-coin CMOS credit/audit writes.
+ 
+ **Upstream note.** Real missing TMS34010 instruction, not Y-unit-specific — offer
+ upstream to birdybro together with P0014 (the two missing MOVE M2M forms).
++
++---
++
++## P0016 — external interrupt pin LINT1 wired (DMA-done -> blit-queue pump)
++
++**Status:** ✅ APPLIED + VERIFIED 2026-07-05. `grep -rn P0016 rtl/`.
++
++**Applied edits:**
++- `rtl/core/tms34010_core.sv`: new input port `lint1_in` (external LINT1 pin level),
++  passed to `u_io_regs`.
++- `rtl/io/tms34010_io_regs.sv`: new input `lint1_in`; INTPEND.X1P (bit 1) is a live
++  MIRROR of the pin (per the 1988 UG §8.3 X1P reflects the pin and is not clearable
++  by writing INTPEND) — OR-folded into both the `intpend_o` tap and CPU reads of
++  INTPEND. The mirror uses `(lint1_in === 1'b1)` so the ~99 legacy core TBs that
++  leave the new port unconnected ('z) keep working unchanged (unconnected = not
++  asserted; synthesis treats === as ==).
++- Wrapper `rtl/yunit/yunit_memsys.sv`: new output `int1` = `yunit_dma.blit_irq`
++  (which has implemented the exact MAME semantics since Phase 0: SET on blit
++  completion, CLEARED by any DMA COMMAND write — midyunit_v.cpp dma_callback
++  370-374 `set_input_line(0, ASSERT_LINE)` / dma_w 433 `CLEAR_LINE`). 20
++  integrated TBs wire memsys.int1 -> core.lint1_in.
++
++**Problem.** The Y-unit game's per-frame drawing is a blit QUEUE pumped by the INT1
++ISR (vector 0xFFFFFFC0 -> `ffe00000`): the ISR writes one queued blit to the DMA
++registers; when the blitter finishes, the HARDWARE asserts LINT1; the ISR pumps the
++next blit; the final COMMAND write clears the line. The 2026-07-04 measurement
++"Smash T.V. is poll-driven, no interrupts needed" was TRUE for the POST/self-test
++(which polls COMMAND bit15) but WRONG for the game proper. With no LINT1 wiring the
++title task submits exactly ONE blit and then yields forever waiting for the pump.
++
++**Evidence (measured).** The boot's cooperative scheduler is fully healthy (walker
++probe: list walk + JUMP-A7 dispatch verified; BOTH tasks entered — title task
++`fff596f0`, service task `ffeaf490`). The title task ran its VRAM clear (183,958 CPU
++VRAM writes), drew ONE item — a single orange line = the top strip of the version-
++info rectangle (confirmed by the cabinet owner: the real game shows an orange
++version box after ROM checks, then high scores) — then parked at resume `fff59890`
++re-sleeping forever. All VRAM activity stops at ~6M cycles; the screen is pixel-
++static through 400+ frames, a coin, and START. GOs/blits: none after the first.
++MAME's `dma_callback` names the missing hardware: DMA-done asserts input line 0.
++
++**VERIFIED (tb_yunit_state, 32M cycles).** With LINT1 wired the blit pump runs and
++THE GAME PLAYS END-TO-END: screens advance (frame dumps now differ per phase), coin
++→ coin sound + credit, START → game-state `@10865A0` 0x30→0x10→0x18 (GAME), and the
++post-START frame shows REAL GAMEPLAY (player sprite, HUD/score panels matching
++MAME's arena layout, weapon/prize icons) with the CPU actively in the pump ISR.
++No illegal opcodes. All regression TBs PASS (the ~99 legacy core TBs run unchanged
++with the pin unconnected, thanks to the === guard).
+diff --git a/rtl/core/tms34010_core.sv b/rtl/core/tms34010_core.sv
+index 45f5278..1abdad4 100644
+--- a/rtl/core/tms34010_core.sv
++++ b/rtl/core/tms34010_core.sv
+@@ -62,7 +62,12 @@ module tms34010_core
+   output core_state_t                         state_o,
+   output logic [ADDR_WIDTH-1:0]               pc_o,
+   output instr_word_t                         instr_word_o,
+-  output logic                                illegal_opcode_o
++  output logic                                illegal_opcode_o,
++
++  // P0016: external interrupt pin LINT1 (level; e.g. Y-unit DMA-done). Mirrored
++  // into INTPEND.X1P by the io_regs block. X/Z-safe there, so legacy TBs that
++  // leave this port unconnected keep working (unconnected == not asserted).
++  input  logic                                lint1_in
+ );
+ 
+   // ===== P0002 (Arcade-SmashTV): forward declarations hoisted for Questa FSE 25.1std
+@@ -2289,7 +2294,8 @@ module tms34010_core
+     .intpend_o(io_intpend),
+     .hstctlh_o(io_hstctlh),
+     .nmi_clear(nmi_clear),
+-    .wvp_set  (wvp_set)
++    .wvp_set  (wvp_set),
++    .lint1_in (lint1_in)      // P0016: external LINT1 pin -> INTPEND.X1P mirror
+   );
+ 
+   // ---- Maskable-interrupt priority encoder (Task 0100) --------------------
+diff --git a/rtl/io/tms34010_io_regs.sv b/rtl/io/tms34010_io_regs.sv
+index c00e5f9..4b87048 100644
+--- a/rtl/io/tms34010_io_regs.sv
++++ b/rtl/io/tms34010_io_regs.sv
+@@ -67,7 +67,12 @@ module tms34010_io_regs
+   output logic [15:0]           intpend_o,// INTPEND: maskable-interrupt pending bits
+   output logic [15:0]           hstctlh_o,// HSTCTLH: host control (NMI/NMIM in bits 8/9)
+   input  logic                  nmi_clear,// 1-cycle: clear HSTCTLH.NMI (device took NMI)
+-  input  logic                  wvp_set   // 1-cycle: set INTPEND.WV (window violation)
++  input  logic                  wvp_set,  // 1-cycle: set INTPEND.WV (window violation)
++  // P0016: external interrupt pin LINT1 (level). Per the 1988 UG §8.3 the
++  // INTPEND.X1P bit REFLECTS the pin level (it is not a latch and cannot be
++  // cleared by writing INTPEND) — so it is OR-mirrored into the INTPEND view
++  // (both the dedicated intpend_o tap and CPU reads of the register).
++  input  logic                  lint1_in
+ );
+ 
+   // I/O-space decode: two MSBs = 11 and bits[29:9] = 0 (range C0000000-
+@@ -121,7 +126,15 @@ module tms34010_io_regs
+ 
+   // Async read: the selected register, or 0 when the address is not in
+   // I/O space (so a non-I/O read contributes nothing to a merged read bus).
+-  assign rdata = is_io ? io_reg[idx] : 16'h0;
++  // P0016: CPU reads of INTPEND see the live LINT1 pin mirrored into X1P.
++  // The `=== 1'b1` makes an UNCONNECTED pin (legacy TBs: 'z) read as not
++  // asserted in sim; synthesis treats it as plain equality.
++  logic lint1_lvl;
++  assign lint1_lvl = (lint1_in === 1'b1);
++  assign rdata = !is_io ? 16'h0
++               : (idx == IO_IDX_INTPEND)
++                 ? (io_reg[idx] | (16'(lint1_lvl) << INT_X1_BIT))
++                 : io_reg[idx];
+ 
+   // Dedicated graphics taps.
+   assign psize_o   = io_reg[IO_IDX_PSIZE];
+@@ -130,7 +143,8 @@ module tms34010_io_regs
+   assign control_o = io_reg[IO_IDX_CONTROL];
+   assign pmask_o   = io_reg[IO_IDX_PMASK];
+   assign intenb_o  = io_reg[IO_IDX_INTENB];
+-  assign intpend_o = io_reg[IO_IDX_INTPEND];
++  // P0016: X1P mirrors the LINT1 pin level into the pending view.
++  assign intpend_o = io_reg[IO_IDX_INTPEND] | (16'(lint1_lvl) << INT_X1_BIT);
+   assign hstctlh_o = io_reg[IO_IDX_HSTCTLH];
+ 
+   // Synchronous write + reset. The reset loop is bounded (32 iterations) and
+-- 
+2.53.0.windows.2
+

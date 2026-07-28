@@ -1,0 +1,271 @@
+From 840c4e3d8f681441982c84b817ec782c74c1c278 Mon Sep 17 00:00:00 2001
+From: Matt Levine <blahm1d@gmail.com>
+Date: Sat, 4 Jul 2026 17:22:09 -0800
+Subject: [PATCH 11/12] core: P0015 - implement MOVE *Rs(SOff),*Rd(DOff)
+ (mem-to-mem offset move)
+
+The TMS34010 MOVE *Rs(SAddr),*Rd(DAddr) -- memory-to-memory with two
+signed 16-bit bit-displacements (0xB800 F=0 / 0xBA00 F=1, 3-word encoding:
+opcode + SOff + DOff) -- was never decoded. Same family as P0014's
+abs-to-abs: birdybro implemented the offset store (0xB000) and load
+(0xB400) but not the 0xB800 M2M form.
+
+THE COIN PATH USES IT: the game reads coins as the upper half of a 32-bit
+read at 0x01C00000 spanning {IN1,IN0} (why no absolute IN1 reference
+exists). Inserting a coin fires the coin handler: coin-sound latch writes
+(0xFD50/0xFF50), then ILLEGAL OPCODE at ffe61000: b800 0010 0020 =
+MOVE *A0(10h),*A0(20h),0.
+
+Fix: iclass INSTR_MOVE_OFF_M2M; decode top6 101110; CORE_FETCH_IMM_LO
+routes to CORE_FETCH_IMM2_LO for the 16-bit DOff (exits straight to
+EXECUTE, no HI word); two-step CORE_MEMORY read at Rs+sext(SOff) ->
+write at Rd+sext(DOff), reusing the P0014 machinery.
+
+VERIFIED (tb_yunit_state, 30M cycles): coin at 24M -> coin sound -> NO
+illegal opcode -> CMOS credit/audit records written in the Williams
+value+complement format (@01400090<=1 coin counter, @01401100<=1,
+@014010e0<=1 with 0xff/0xffff/0xfe complements) -> game continues clean.
+THE GAME COINS UP. MM TBs + tb_yunit_mem/memsys/dma PASS.
+
+Also fixes tb_immi_il's stale SUBI/CMPI vectors (pre-existing debt from
+P0008: the immediates must be stored one's-complemented, like the P0003
+ANDI vector fix). tb_immi_il now PASSES.
+
+---
+ PATCHES.md                  | 34 +++++++++++++++++++++++++++++
+ rtl/core/tms34010_core.sv   | 43 +++++++++++++++++++++++++++++++------
+ rtl/core/tms34010_decode.sv | 22 +++++++++++++++++++
+ rtl/tms34010_pkg.sv         |  5 ++++-
+ sim/tb/tb_immi_il.sv        |  8 +++++--
+ 5 files changed, 103 insertions(+), 9 deletions(-)
+
+diff --git a/PATCHES.md b/PATCHES.md
+index 024c814..1f181df 100644
+--- a/PATCHES.md
++++ b/PATCHES.md
+@@ -536,3 +536,37 @@ executes, the boot runs the interrupt-driven main loop with **no illegal opcode*
+ **Upstream note.** A real missing TMS34010 instruction, not Y-unit-specific — offer
+ upstream to birdybro. (The XY-address and F=1 variants share the datapath; F is honoured
+ via `mv_fs`. Only the abs-to-abs *linear* form is exercised so far.)
++
++---
++
++## P0015 — MOVE *Rs(SOff),*Rd(DOff) (mem-to-mem offset field move) not implemented
++
++**Status:** ✅ APPLIED 2026-07-05 (verification run in flight). `grep -rn P0015 rtl/`.
++
++**Applied edits (mirrors P0014):**
++- `rtl/tms34010_pkg.sv`: new iclass `INSTR_MOVE_OFF_M2M = 7'd100`.
++- `rtl/core/tms34010_decode.sv`: decode top6 `101110` (`0xB800` F=0 / `0xBA00` F=1;
++  `[9]`=F, `[8:5]`=Rs, `[4]`=file, `[3:0]`=Rd) → `INSTR_MOVE_OFF_M2M`; `needs_imm16`
++  + sign-extend (SOff), `needs_memory_op`, no writeback, flags Unaffected.
++- `rtl/core/tms34010_core.sv`: `CORE_FETCH_IMM_LO` routes this iclass to
++  `CORE_FETCH_IMM2_LO` (fetches the 16-bit DOff into `imm2_lo_q`; exits straight to
++  EXECUTE — no HI word, unlike P0014's 32-bit DAddr); two-step CORE_MEMORY: step 0
++  reads the `mv_fs` field at `rf_rs1_data + sext(SOff)` into `move_data_q`, step 1
++  writes it to `rf_rs2_data + sext(DOff)` (`imm2_off_sext`). Pointers unchanged.
++
++**Problem.** The TMS34010 `MOVE *Rs(SAddr),*Rd(DAddr)` — memory-to-memory with two
++signed 16-bit bit-displacements (3-word encoding: opcode + SOff + DOff, SPVU001A
++12-142) — was never decoded. Same family as P0014's abs-to-abs: birdybro implemented
++the offset store (`0xB000`) and load (`0xB400`) but not the `0xB800` M2M form.
++
++**Evidence.** THE COIN PATH USES IT: with Phase-4 inputs wired, inserting a coin
++(IN1 bit0 low — read by the game as the upper half of a 32-BIT read at 0x01C00000
++spanning {IN1,IN0}, which is why no absolute IN1-address reference exists for the
++scan) triggers the coin handler: two sound-latch writes (`0xFD50`, `0xFF50` at
++`ffe61220`/`ffe612b0` — the coin sound), then an ILLEGAL OPCODE at `ffe61000`:
++`b800 0010 0020` = `MOVE *A0(10h),*A0(20h),0` (unidasm), a 32-cycle-later derail
++(`tb_yunit_state`, cyc 24,537,864). Post-fix run in flight: expect the coin handler
++to complete (no illegal) and post-coin CMOS credit/audit writes.
++
++**Upstream note.** Real missing TMS34010 instruction, not Y-unit-specific — offer
++upstream to birdybro together with P0014 (the two missing MOVE M2M forms).
+diff --git a/rtl/core/tms34010_core.sv b/rtl/core/tms34010_core.sv
+index 55789b6..45f5278 100644
+--- a/rtl/core/tms34010_core.sv
++++ b/rtl/core/tms34010_core.sv
+@@ -244,6 +244,11 @@ module tms34010_core
+   instr_word_t imm2_hi_q;
+   wire [DATA_WIDTH-1:0] imm2_32 = {imm2_hi_q, imm2_lo_q};
+   wire is_mv_abs_m2m = (decoded.iclass == INSTR_MOVE_ABS_M2M);
++  // P0015: MOVE *Rs(SOff),*Rd(DOff) — the second immediate is a SIGNED 16-bit
++  // bit-displacement (imm2_lo only; no HI word is fetched for this form).
++  wire is_mv_off_m2m = (decoded.iclass == INSTR_MOVE_OFF_M2M);
++  wire [DATA_WIDTH-1:0] imm2_off_sext =
++      {{(DATA_WIDTH-INSTR_WORD_WIDTH){imm2_lo_q[INSTR_WORD_WIDTH-1]}}, imm2_lo_q};
+ 
+   // Long-form JRcc target: PC_after_both_fetches + sign_extend(disp16) × 16.
+   // By the time the FSM hits CORE_WRITEBACK, pc_value already equals
+@@ -314,8 +319,10 @@ module tms34010_core
+       if (decoded.iclass == INSTR_MOVE_FIELD_M2M && mem_op_step == 2'd0) begin
+         move_data_q <= mem_rdata_eff;
+       end
+-      // P0014: MOVE @,@ step 0 latches the source field for the step-1 write.
+-      if (decoded.iclass == INSTR_MOVE_ABS_M2M && mem_op_step == 2'd0) begin
++      // P0014/P0015: MOVE @,@ and MOVE *Rs(o),*Rd(o) step 0 latches the source
++      // field for the step-1 write.
++      if ((decoded.iclass == INSTR_MOVE_ABS_M2M ||
++           decoded.iclass == INSTR_MOVE_OFF_M2M) && mem_op_step == 2'd0) begin
+         move_data_q <= mem_rdata_eff;
+       end
+       // PIXT store plane-mask RMW: step 0 reads the destination pixel; latch
+@@ -346,7 +353,8 @@ module tms34010_core
+                                  ? 2'd0
+                                  : mem_op_step + 2'd1;
+         INSTR_MOVE_FIELD_M2M,
+-        INSTR_MOVE_ABS_M2M:                              // P0014
++        INSTR_MOVE_ABS_M2M,                              // P0014
++        INSTR_MOVE_OFF_M2M:                              // P0015
+                     mem_op_step <= (mem_op_step == 2'd1) ? 2'd0 : mem_op_step + 2'd1;
+         // PIXT store RMW: step 0 (read) -> step 1 (write) -> 0. Regular MOVE
+         // store (no force_pixel) is single-step and falls through to default.
+@@ -2638,7 +2646,11 @@ module tms34010_core
+         mem_size = INSTR_WORD_BITS;
+         if (mem_ack) begin
+           pc_advance_en = 1'b1;
+-          state_d = decoded.needs_imm32 ? CORE_FETCH_IMM_HI : CORE_EXECUTE;
++          // P0015: MOVE *Rs(SOff),*Rd(DOff) fetches a SECOND 16-bit word
++          // (DOff) after SOff — route via CORE_FETCH_IMM2_LO.
++          state_d = decoded.needs_imm32 ? CORE_FETCH_IMM_HI
++                  : is_mv_off_m2m       ? CORE_FETCH_IMM2_LO
++                                        : CORE_EXECUTE;
+         end
+       end
+ 
+@@ -2655,6 +2667,8 @@ module tms34010_core
+       end
+ 
+       // P0014: fetch the DAddr (second 32-bit immediate) of MOVE @SAddr,@DAddr.
++      // P0015: also fetches the 16-bit DOff of MOVE *Rs(SOff),*Rd(DOff) — that
++      // form needs no HI word, so it exits straight to EXECUTE.
+       CORE_FETCH_IMM2_LO: begin
+         mem_req  = 1'b1;
+         mem_we_int   = 1'b0;
+@@ -2662,7 +2676,7 @@ module tms34010_core
+         mem_size = INSTR_WORD_BITS;
+         if (mem_ack) begin
+           pc_advance_en = 1'b1;
+-          state_d = CORE_FETCH_IMM2_HI;
++          state_d = is_mv_off_m2m ? CORE_EXECUTE : CORE_FETCH_IMM2_HI;
+         end
+       end
+ 
+@@ -3134,6 +3148,22 @@ module tms34010_core
+               mem_wdata  = move_data_q;    // field (low FS bits) read in step 0
+             end
+           end
++          INSTR_MOVE_OFF_M2M: begin
++            // P0015: two-step offset mem->mem. Step 0 reads the FS-bit field at
++            // mem[Rs + sext(SOff)] (imm32 = sext(imm_lo) via the needs_imm16 +
++            // sign-extend path) into move_data_q; step 1 writes it to
++            // mem[Rd + sext(DOff)] (imm2_off_sext). Pointers unchanged.
++            mem_req   = 1'b1;
++            mem_size  = mv_fs;
++            if (mem_op_step == 2'd0) begin
++              mem_we_int = 1'b0;
++              mem_addr   = rf_rs1_data + imm32;          // Rs + sext(SOff)
++            end else begin
++              mem_we_int = 1'b1;
++              mem_addr   = rf_rs2_data + imm2_off_sext;  // Rd + sext(DOff)
++              mem_wdata  = move_data_q;
++            end
++          end
+           default: ;  // no transaction (shouldn't reach with needs_memory_op=0)
+         endcase
+         if (mem_ack) begin
+@@ -3146,7 +3176,8 @@ module tms34010_core
+             INSTR_MMTM,
+             INSTR_MMFM: if (mm_mask_will_be_empty) state_d = CORE_WRITEBACK;
+             INSTR_MOVE_FIELD_M2M,
+-            INSTR_MOVE_ABS_M2M:   if (mem_op_step == 2'd1) state_d = CORE_WRITEBACK; // P0014
++            INSTR_MOVE_ABS_M2M,                                                     // P0014
++            INSTR_MOVE_OFF_M2M:   if (mem_op_step == 2'd1) state_d = CORE_WRITEBACK; // P0015
+             // PIXT store RMW stays for its write step; single-step store exits.
+             INSTR_MOVE_FIELD_STORE:
+                         if (!pixt_rmw || mem_op_step == 2'd1) state_d = CORE_WRITEBACK;
+diff --git a/rtl/core/tms34010_decode.sv b/rtl/core/tms34010_decode.sv
+index 9bcc1d4..c7d5270 100644
+--- a/rtl/core/tms34010_decode.sv
++++ b/rtl/core/tms34010_decode.sv
+@@ -128,8 +128,11 @@ module tms34010_decode
+   // instruction word. The pointer register is unchanged.
+   //   MOVE Rs,*Rd(off) : 1011 00FS  (top6 = 101100, 0xB000) store
+   //   MOVE *Rs(off),Rd : 1011 01FS  (top6 = 101101, 0xB400) load
++  //   MOVE *Rs(SOff),*Rd(DOff) : 1011 10FS (top6 = 101110, 0xB800) mem-to-mem
++  //     (P0015: 3-word — opcode + 16-bit SOffset + 16-bit DOffset)
+   localparam logic [5:0] MOVE_OFF_STORE_TOP6 = 6'b101100;
+   localparam logic [5:0] MOVE_OFF_LOAD_TOP6  = 6'b101101;
++  localparam logic [5:0] MOVE_OFF_M2M_TOP6   = 6'b101110;
+ 
+   // Auto inc/dec indirect MOVE (Task 0060). Same field semantics as the
+   // plain forms; the pointer register steps by the field size (±32 at
+@@ -1016,6 +1019,25 @@ module tms34010_decode
+       decoded.wb_flag_mask    = '{n: 1'b1, c: 1'b0, z: 1'b1, v: 1'b1};
+     end
+ 
++    // MOVE *Rs(SOff),*Rd(DOff) — mem-to-mem with two signed 16-bit bit-
++    // displacements (P0015; SPVU001A 12-142). Reads the FS field at
++    // mem[Rs + sext(SOff)] and writes it to mem[Rd + sext(DOff)]. Both
++    // pointers unchanged; all flags Unaffected. needs_imm16 fetches SOff
++    // (imm_lo); the core FSM fetches DOff (imm2_lo) after it because the
++    // iclass is MOVE_OFF_M2M (mirrors P0014's second-immediate fetch).
++    if (top6 == MOVE_OFF_M2M_TOP6) begin
++      decoded.illegal         = 1'b0;
++      decoded.iclass          = INSTR_MOVE_OFF_M2M;
++      decoded.rd_file         = reg_file_from_instr;   // Rs & Rd same file
++      decoded.rd_idx          = reg_idx_from_instr;    // Rd = dest pointer (instr[3:0])
++      decoded.rs_idx          = rs_idx_from_instr;     // Rs = src  pointer (instr[8:5])
++      decoded.needs_imm16     = 1'b1;                  // fetch SOffset (16-bit)
++      decoded.imm_sign_extend = 1'b1;                  // signed offset
++      decoded.needs_memory_op = 1'b1;
++      decoded.wb_reg_en       = 1'b0;                  // pointers unchanged
++      decoded.wb_flags_en     = 1'b0;                  // all flags Unaffected
++    end
++
+     // -----------------------------------------------------------------------
+     // MOVE *Rs, *Rd  — indirect-to-indirect field move  (SPVU001A 12-137)
+     //
+diff --git a/rtl/tms34010_pkg.sv b/rtl/tms34010_pkg.sv
+index fb4c075..f97e6d3 100644
+--- a/rtl/tms34010_pkg.sv
++++ b/rtl/tms34010_pkg.sv
+@@ -572,9 +572,12 @@ package tms34010_pkg;
+     INSTR_LINE             = 7'd98, // LINE Z — Bresenham inner loop: draw COUNT pixels of
+                               //                     COLOR1 along a line. B-file: d/DADDR/DYDX
+                               //                     (b:a)/COUNT/INC1/INC2. Enc 0xDF1A/0xDF9A.
+-    INSTR_MOVE_ABS_M2M     = 7'd99  // MOVE @SAddr,@DAddr — field at mem[SAddr] -> mem[DAddr],
++    INSTR_MOVE_ABS_M2M     = 7'd99, // MOVE @SAddr,@DAddr — field at mem[SAddr] -> mem[DAddr],
+                               //                     both absolute (32-bit each). Enc 0x05C0 (F=0)/
+                               //                     0x0DC0 (F=1). P0014: 4 imm words, read-then-write.
++    INSTR_MOVE_OFF_M2M     = 7'd100 // MOVE *Rs(SOff),*Rd(DOff) — field at mem[Rs+sext(SOff)] ->
++                              //                     mem[Rd+sext(DOff)]. Enc 0xB800 (F=0)/0xBA00 (F=1).
++                              //                     P0015: 2 disp words, read-then-write.
+   } instr_class_t;
+ 
+   // Condition codes used by JRcc / JAcc (and other conditional ops).
+diff --git a/sim/tb/tb_immi_il.sv b/sim/tb/tb_immi_il.sv
+index 0e4b9fa..b6be256 100644
+--- a/sim/tb/tb_immi_il.sv
++++ b/sim/tb/tb_immi_il.sv
+@@ -140,11 +140,15 @@ module tb_immi_il;
+     p = place_movi_il(p, REG_FILE_A, 4'd1, 32'h0001_0000);
+     p = place_imm_il (p, ADDI_IL_TOP11, REG_FILE_A, 4'd1, 32'h0002_0000);
+ 
++    // SUBI/CMPI store the ONE'S COMPLEMENT of the operand in the immediate
++    // field (TI assembler + real ROM: "SUBI 4h" -> 0xFFFB, "CMPI 505h" ->
++    // 0xFAFA). CPU computes Rd - ~imm. Encode ~K so the effective operand is
++    // K. (P0008 — same convention as ANDI/P0003 below.)
+     p = place_movi_il(p, REG_FILE_A, 4'd2, 32'h0100_0000);
+-    p = place_imm_il (p, SUBI_IL_TOP11, REG_FILE_A, 4'd2, 32'h0001_0000);
++    p = place_imm_il (p, SUBI_IL_TOP11, REG_FILE_A, 4'd2, ~32'h0001_0000);
+ 
+     p = place_movi_il(p, REG_FILE_A, 4'd3, 32'hCAFE_BABE);
+-    p = place_imm_il (p, CMPI_IL_TOP11, REG_FILE_A, 4'd3, 32'hCAFE_BABE);
++    p = place_imm_il (p, CMPI_IL_TOP11, REG_FILE_A, 4'd3, ~32'hCAFE_BABE);
+ 
+     // ANDI stores the ONE'S COMPLEMENT of the mask in the immediate field
+     // (TI assembler + real ROM: "ANDI 1Fh" -> 0xFFFFFFE0). CPU does Rd & ~imm.
+-- 
+2.53.0.windows.2
+

@@ -1,0 +1,520 @@
+From 815423be32e08ef895a8124e8d746cc52c3126e5 Mon Sep 17 00:00:00 2001
+From: Matt Levine <blahm1d@gmail.com>
+Date: Sat, 4 Jul 2026 22:19:14 -0800
+Subject: [PATCH 01/12] Local Y-unit patches on birdybro 39c7aaf (P0001-P0003)
+
+Accumulated local patches for the Smash T.V. / Y-unit integration, kept on
+this branch so `main` stays pristine at birdybro's 39c7aaf for clean upstream
+pulls. All documented in PATCHES.md.
+
+- P0001: reset-vector read (CORE_RESET -> CORE_RESET_VEC reads mem[0xFFFFFFE0]
+  32-bit -> PC). Required to boot a real game.
+- P0002: hoist 33 forward-referenced decls for Questa FSE 25.1std
+  declaration-before-use (behavior-neutral; tool in patches/).
+- P0003: TMS34010 ANDI immediate is one's-complemented. Decoder used
+  ALU_OP_AND (Rd & imm) but the TI assembler stores ~K (real ROM: "ANDI 1Fh"
+  = 0xFFFFFFE0), so the op must be Rd & ~imm. Fix: ALU_OP_ANDN. Every ANDI was
+  silently wrong (no illegal op, so it survived boot). Root-caused via the MAME
+  debugger + unidasm against the Smash T.V. boot RAM-test field-size setup;
+  verified FS1=16 (was 0/32), palette stride matches MAME, tb_immi_il PASS
+  (its ANDI vector corrected to encode the complemented immediate),
+  tb_yunit_boot PASS.
+
+---
+ PATCHES.md                  | 143 ++++++++++++++++++++++++++++++++++++
+ patches/hoist_p0002.py      |  21 ++++++
+ patches/p0002_signals.txt   |   5 ++
+ rtl/core/tms34010_core.sv   |  87 +++++++++++++---------
+ rtl/core/tms34010_decode.sv |   7 +-
+ rtl/tms34010_pkg.sv         |   3 +-
+ sim/tb/tb_immi_il.sv        |   5 +-
+ 7 files changed, 235 insertions(+), 36 deletions(-)
+ create mode 100644 PATCHES.md
+ create mode 100644 patches/hoist_p0002.py
+ create mode 100644 patches/p0002_signals.txt
+
+diff --git a/PATCHES.md b/PATCHES.md
+new file mode 100644
+index 0000000..378aa98
+--- /dev/null
++++ b/PATCHES.md
+@@ -0,0 +1,143 @@
++# Local patches to the vendored TMS34010_sv core
++
++The core is vendored from `birdybro/TMS34010_sv` (MIT, commit 39c7aaf). Keep
++patches here small, documented, and upstreamable so `git pull` conflicts stay
++localized. Prefer proposing them upstream.
++
++Toolchain: the integrated core sim needs **Questa** (birdybro's toolchain). The
++core uses SV struct assignment patterns (`'{n:…,c:…,z:…,v:…}`) and `unsigned'()`
++casts (e.g. core.sv:1503–2370) that **Icarus 12 cannot parse**. Icarus is fine
++for the Icarus-clean Y-unit wrapper unit tests (`sim/`), not for the core.
++
++---
++
++## P0001 — reset-vector read (REQUIRED to boot a real game)
++
++**Status:** ✅ APPLIED 2026-07-03 (3 edits, marked `P0001` in-source). Verify with
++Questa via `sim/tb_yunit_boot.sv` (Icarus can't compile the core). Applied edits:
++- `rtl/tms34010_pkg.sv` — added `CORE_RESET_VEC = 6'd38` to `core_state_t`.
++- `rtl/core/tms34010_core.sv` (mem-interface comb) — `CORE_RESET` now `→ CORE_RESET_VEC`;
++  new `CORE_RESET_VEC` reads `mem[TRAP_VECTOR_BASE]` (`0xFFFFFFE0`, 32-bit), `→ CORE_FETCH` on ack.
++- `rtl/core/tms34010_core.sv` (pc-load comb) — on `CORE_RESET_VEC && mem_ack`,
++  `pc_load_en=1; pc_load_value=mem_rdata_eff` (loads PC = the vector word).
++To re-apply after `git pull`: `grep -n P0001 rtl/**/*.sv` shows all three sites.
++
++**Problem.** `CORE_RESET` (core.sv:2450) transitions straight to `CORE_FETCH`
++with `pc = RESET_PC = '0` (pkg RESET_PC is flagged a placeholder). Real TMS34010
++hardware, on reset, loads the PC from the 32-bit long-word at the level-0 trap
++(reset) vector `0xFFFFFFE0` and begins execution there.
++
++**Evidence.** Smash T.V. rev 8.00: the reset long-word at bit-addr `0xFFFFFFE0`
++= `0xFFE0F5C0` (measured from the program ROM; the ROM tail is a clean
++`0xFFE0xxxx` vector table). With `RESET_PC=0` the core fetches garbage at 0 and
++never boots. Confirmed via `yunit_mem` (a 32b read @0xFFFFFFE0 returns
++`0xFFE0F5C0`).
++
++**Fix.** Model reset like the existing interrupt-vector read (`CORE_INT_VECTOR`,
++core.sv:2497), which already does exactly this shape:
++
++```
++mem_req  = 1'b1;
++mem_addr = <vector>;          // here: 32'hFFFF_FFE0  (TRAP_VECTOR_BASE, trap 0)
++mem_size = MEM_SIZE_32;       // 32-bit
++if (mem_ack) <latch mem_rdata -> PC>;
++```
++
++Concretely, add a `CORE_RESET_VEC` state entered from `CORE_RESET`:
++
++1. `CORE_RESET → CORE_RESET_VEC` (instead of `→ CORE_FETCH`).
++2. `CORE_RESET_VEC`: drive `mem_req=1`, `mem_addr=TRAP_VECTOR_BASE` (`0xFFFFFFE0`),
++   `mem_size=MEM_SIZE_32`; on `mem_ack`, load PC from `mem_rdata` (reuse the
++   `pc_load_value`/`popped_pc_q` path used by `CORE_INT_VECTOR`) and go to
++   `CORE_FETCH`.
++
++This is ~one state + the PC-load reuse — small and localized. It generalizes to
++every T/Y/Z-unit game (each has its own reset vector), which is why it is
++preferred over hardcoding `RESET_PC` per game.
++
++**Verification (Questa).** In `tb_yunit_boot` (to write): core + `yunit_mem` with
++the smashtv ROM; after reset, assert `pc_o == 0xFFE0F5C0` before the first real
++fetch, then that fetches walk into the program (cross-check the first N fetch
++addresses against `mame smashtv -debug`).
++
++**Upstream note.** birdybro flags `RESET_PC` as a placeholder — this is the
++natural next step for their core too. Offer it upstream once verified.
++
++---
++
++## P0002 — hoist forward-referenced declarations (Questa FSE 25.1std compat)
++
++**Status:** ✅ APPLIED 2026-07-03. **Compile-verified** (full design, 0 errors under
++Questa FSE 25.1std / 2025.2). Behavior-neutral; runtime verify pending license (date-gated).
++
++**Problem.** `tms34010_core.sv` references 33 module signals *before* their textual
++declaration (legal SV — module items are order-independent; fine on birdybro's FSE
++25.1.1 and on Icarus/Quartus). **FSE 25.1std (Questa 2025.2) enforces
++declaration-before-use** and rejects them (vlog-2730 "undefined", or vlog-2388 for
++LHS-of-assign cases like `wvp_set`). No vlog flag / modelsim.ini key relaxes it
++(verified: `-permissive`, `-mfcu`, unit-import, `-svinputport=var` — the last fixes a
++*separate* typed-port issue only).
++
++**Fix.** Move the 33 signals' declaration lines verbatim to a `// ===== P0002` block
++right after the module port list (before first use). Pure declarations → order-neutral,
++so no behavior change; the clean compile confirms no syntax/type breakage.
++
++**Re-apply after `git pull`** (regenerates the hoist from a fresh core):
++```
++git -C rtl/tms34010 checkout rtl/core/tms34010_core.sv
++python3 rtl/tms34010/patches/hoist_p0002.py \
++        rtl/tms34010/rtl/core/tms34010_core.sv \
++        rtl/tms34010/patches/p0002_signals.txt
++# then re-apply P0001 (above) — the two P0001 edits target FSM/pc-load blocks the
++# hoist does not touch, so apply order is hoist-then-P0001 or vice-versa.
++```
++The signal list `patches/p0002_signals.txt` is self-converging: if a future upstream
++adds a new forward-ref, the compile prints it (vlog-2730/2388) — append it and re-run.
++
++**Not needed on:** Icarus, Quartus synth, or Questa FSE **25.1.1**. Only 25.1std/2025.2.
++Compile flag required regardless: `vlog -svinputport=var` (see `sim/run_questa.sh`).
++
++---
++
++## P0003 — ANDI immediate is one's-complemented (CORRECTNESS: every ANDI was wrong)
++
++**Status:** ✅ APPLIED + VERIFIED 2026-07-04. One-token core fix + one test-vector fix.
++Marked `P0003` in-source. Re-apply after `git pull`: `grep -rn P0003 rtl/`.
++
++**Applied edits:**
++- `rtl/core/tms34010_decode.sv` (`ANDI_IL_TOP11` block, ~line 691):
++  `decoded.alu_op = ALU_OP_AND;` → **`ALU_OP_ANDN;`**
++- `sim/tb/tb_immi_il.sv` (ANDI vector): the placed immediate `0x0FF0FF0F` →
++  **`0xF00F00F0`** (= `~0x0FF0FF0F`), so the effective mask stays `0x0FF0FF0F`
++  and the expected result `0x00F0F000` is unchanged. The old vector encoded the
++  *wrong* convention (direct mask) and only passed because the core was also wrong.
++
++**Problem.** On the TMS34010 the `ANDI` instruction stores the **one's complement**
++of the mask in its 32-bit immediate field. The TI assembler emits `~K`, and the CPU
++computes `Rd & ~(immediate_field) = Rd & K`. birdybro's decoder set `ALU_OP_AND`
++(`a & b`) with the raw immediate, so it computed `Rd & ~K` — the complement of the
++intended mask. **Every `ANDI` in every game was silently corrupted.** (`ORI`/`XORI`
++store the immediate *directly* and were already correct; the register form `ANDN Rs,Rd`
++was already correct — it uses `ALU_OP_ANDN`.)
++
++**Evidence (real ROM + MAME, authoritative).** Smash T.V. boot RAM-test field-size
++setup: `MOVE A11,A9 (=0x10); ANDI 1Fh,A9; EXGF A9,1` (sets FS1 from the stride).
++- The ROM encodes "ANDI 1Fh" as raw immediate **`0xFFFFFFE0`** (`= ~0x1F`); both
++  `unidasm -arch tms34010` and MAME disassemble it as `ANDI 1Fh`.
++- **MAME** (`mame smashtv -debug`, trace with `tracelog A9`): after `ANDI 1Fh` on
++  `A9=0x10`, **A9 = 0x10** (mask `0x1F` applied). → complement model, definitive.
++- **This core, pre-fix** (Questa `tb_yunit_fsprobe`): `A9 = 0x10 & 0xFFFFFFE0 = 0`,
++  so `EXGF` loaded **FS1=0** (=32-bit fields). The palette RAM test then filled with
++  a **32-bit** stride where MAME uses **16-bit** — the first *observable* symptom.
++- **This core, post-fix:** `A9=0x10` → `FS1=16` → palette stride **16**, byte-exact
++  with MAME. `tb_immi_il` PASS, `tb_yunit_boot` PASS, RAM-test descriptor march
++  (`tb_yunit_ramtest`) matches MAME's golden list on start-addr + count + stride.
++
++**Why boot appeared to "work" before:** wrong `ANDI` results produced wrong *data*,
++not illegal opcodes, so PC never derailed. The RAM test even "progressed" because
++fill and verify used the same (wrong-but-consistent) field size. The bug only became
++visible by diffing field *stride* against MAME.
++
++**Upstream note.** This is a real core bug (not Y-unit-specific) — offer upstream to
++birdybro along with the corrected `tb_immi_il` vector. Spec: TMS34010 User's Guide,
++`ANDI` (the immediate is stored complemented). MAME `tms34010` executes the same.
+diff --git a/patches/hoist_p0002.py b/patches/hoist_p0002.py
+new file mode 100644
+index 0000000..52e06ab
+--- /dev/null
++++ b/patches/hoist_p0002.py
+@@ -0,0 +1,21 @@
++import re, sys
++f = sys.argv[1]; sigfile = sys.argv[2]
++sigs = open(sigfile).read().split()
++lines = open(f, encoding="utf-8").read().split("\n")
++mod_i = next(i for i,l in enumerate(lines) if l.startswith("module tms34010_core"))
++close_i = next(i for i in range(mod_i,len(lines)) if lines[i].strip()==");")
++def is_decl_of(l,s):
++    code=l.split("//")[0].rstrip()
++    return code.endswith(";") and re.match(r'^  (logic|wire|reg)\b.*\b'+re.escape(s)+r'\b', l)
++move=set()
++for s in sigs:
++    h=next((i for i in range(close_i+1,len(lines)) if is_decl_of(lines[i],s)),None)
++    if h is not None: move.add(h)
++move=sorted(move); moved=[lines[i] for i in move]
++kept=[l for i,l in enumerate(lines) if i not in set(move)]
++ins=next(i for i in range(mod_i,len(kept)) if kept[i].strip()==");")
++blk=["","  // ===== P0002 (Arcade-SmashTV): forward declarations hoisted for Questa FSE 25.1std",
++ "  // (2025.2), which enforces declaration-before-use. Pure decls moved verbatim from",
++ "  // below; behavior-neutral (SV module items are order-independent). See PATCHES.md."]+moved+[""]
++open(f,"w",encoding="utf-8").write("\n".join(kept[:ins+1]+blk+kept[ins+1:]))
++print("hoisted %d lines for %d signals"%(len(move),len(sigs)))
+diff --git a/patches/p0002_signals.txt b/patches/p0002_signals.txt
+new file mode 100644
+index 0000000..94b2fee
+--- /dev/null
++++ b/patches/p0002_signals.txt
+@@ -0,0 +1,5 @@
++div_v drav_inside_q drav_w_q fill_is_xy int_push_q io_control io_convdp io_convsp
++io_pmask io_psize is_div is_drav is_fill is_line is_mpy is_pblt line_aborted_q
++line_last_inside_q line_win_en mem_rdata_eff pair_wb_step pblt_array_hit pblt_w2_q
++pix_dest_q pix_xy_dst_linear pix_xy_xsh pixt_inside_q pixt_rmw pixt_xy_win
++rf_rs1_data rf_rs2_data rf_rs3_data wvp_set
+diff --git a/rtl/core/tms34010_core.sv b/rtl/core/tms34010_core.sv
+index 6b8f5c9..4fd428b 100644
+--- a/rtl/core/tms34010_core.sv
++++ b/rtl/core/tms34010_core.sv
+@@ -65,6 +65,42 @@ module tms34010_core
+   output logic                                illegal_opcode_o
+ );
+ 
++  // ===== P0002 (Arcade-SmashTV): forward declarations hoisted for Questa FSE 25.1std
++  // (2025.2), which enforces declaration-before-use. Pure decls moved verbatim from
++  // below; behavior-neutral (SV module items are order-independent). See PATCHES.md.
++  logic                  pblt_w2_q;        // W=2 (miss detection) active
++  logic pblt_w1_q, pblt_array_hit;
++  logic [1:0]            drav_w_q;          // CONTROL.W latched at EXECUTE
++  logic                  drav_inside_q;     // Rd's pixel lies inside the window
++  logic                  line_last_inside_q;  // inside status of the last pixel
++  logic                  line_aborted_q;      // W=1/W=2 aborted on a violation
++  logic                  line_win_en;         // any window mode active (W!=0)
++  logic [DATA_WIDTH-1:0]  rf_rs1_data;
++  logic [DATA_WIDTH-1:0]  rf_rs2_data;
++  logic [DATA_WIDTH-1:0]  rf_rs3_data;
++  logic is_fill, fill_is_xy, is_pblt;
++  logic is_drav;
++  logic is_line;
++  logic                  pixt_rmw;
++  logic [DATA_WIDTH-1:0] pix_dest_q;     // dest pixel latched at the read step
++  logic                  pixt_xy_win;
++  logic                  pixt_inside_q;     // latched at the RMW write step
++  logic [4:0]            pix_xy_xsh;
++  logic [DATA_WIDTH-1:0] pix_xy_dst_linear;
++  logic                  is_mpy, mpy_signed, mpy_rd_even;
++  logic                  is_div, is_divu, is_modu, is_divs, is_mods;
++  logic div_signed_ovf, div_v;
++  logic is_pair_wb, pair_second_pass, pair_wb_step;
++  logic [15:0]           io_psize;     // PSIZE register (pixel size, for PIXT/CVXYL)
++  logic [15:0]           io_convdp;    // CONVDP register (XY->linear dest pitch)
++  logic [15:0]           io_convsp;    // CONVSP register (XY->linear source pitch)
++  logic [15:0]           io_control;   // CONTROL register (PPOP, T, window mode, ...)
++  logic [15:0]           io_pmask;     // PMASK register (plane mask)
++  logic                  wvp_set;      // pulse to set INTPEND.WV on a window violation
++  logic [DATA_WIDTH-1:0] mem_rdata_eff;
++  logic                  int_push_q;
++
++
+   // ---------------------------------------------------------------------------
+   // Pixel-processing operation (PPOP) — shared by the PIXT store engine and
+   // the graphics fill/blt engines. Returns f(src, dest) per the CONTROL.PPOP
+@@ -576,7 +612,6 @@ module tms34010_core
+   // WV interrupt are not implemented (A0031).
+   logic [DATA_WIDTH-1:0] pblt_dst_xy_raw_q, pblt_wstart_q, pblt_wend_q;
+   logic                  pblt_win_en_q;    // W=3 per-pixel clip active
+-  logic                  pblt_w2_q;        // W=2 (miss detection) active
+   logic [15:0]           pblt_px, pblt_py;
+   logic                  pblt_in_window, pblt_clip_out;
+   assign pblt_px = pblt_dst_xy_raw_q[15:0]            + pblt_x_q;
+@@ -599,7 +634,6 @@ module tms34010_core
+      && (pblt_arr_y0 >= rf_rs1_data[DATA_WIDTH-1:16]) && (pblt_arr_y1 <= rf_rs2_data[DATA_WIDTH-1:16]);
+   // W=1 (hit detection): never draws; overlap test from the LATCHED WSTART/WEND
+   // (valid in CORE_PBLT_WIN_HIT). Mirrors the FILL W=1 path.
+-  logic pblt_w1_q, pblt_array_hit;
+   assign pblt_array_hit = !(
+         (pblt_arr_x1 < pblt_wstart_q[15:0]) || (pblt_arr_x0 > pblt_wend_q[15:0])
+      || (pblt_arr_y1 < pblt_wstart_q[DATA_WIDTH-1:16]) || (pblt_arr_y0 > pblt_wend_q[DATA_WIDTH-1:16]));
+@@ -734,8 +768,6 @@ module tms34010_core
+   // is drawn only for W=0, or W=2/W=3 when inside. V (W!=0) = NOT inside; WVP is
+   // requested for W=1 inside (hit) or W=2 outside (miss). The advance always
+   // happens. Reuses the shared fill_win_flag_wb / wvp_set V-write path.
+-  logic [1:0]            drav_w_q;          // CONTROL.W latched at EXECUTE
+-  logic                  drav_inside_q;     // Rd's pixel lies inside the window
+   logic                  drav_in_window;    // combinational test at SETUP_WIN
+   logic                  drav_draw;         // pixel is actually written
+   assign drav_in_window =
+@@ -821,10 +853,7 @@ module tms34010_core
+   // the end reflects whether the last pixel calculated was inside. W=1/W=2
+   // (abort modes) are deferred (A0031). WSTART/WEND read at CORE_LINE_SETUP_WIN.
+   logic [DATA_WIDTH-1:0] line_wstart_q, line_wend_q;
+-  logic                  line_last_inside_q;  // inside status of the last pixel
+-  logic                  line_aborted_q;      // W=1/W=2 aborted on a violation
+   logic [1:0]            line_w_mode;
+-  logic                  line_win_en;         // any window mode active (W!=0)
+   logic                  line_in_window, line_draw_pixel, line_clip_out, line_abort;
+   assign line_w_mode    = io_control[CTRL_W_HI:CTRL_W_LO];
+   assign line_win_en    = (line_w_mode != 2'd0);
+@@ -1045,13 +1074,10 @@ module tms34010_core
+   // Register-file ports.
+   reg_file_t              rf_rs1_file;
+   reg_idx_t               rf_rs1_idx;
+-  logic [DATA_WIDTH-1:0]  rf_rs1_data;
+   reg_file_t              rf_rs2_file;
+   reg_idx_t               rf_rs2_idx;
+-  logic [DATA_WIDTH-1:0]  rf_rs2_data;
+   reg_file_t              rf_rs3_file;
+   reg_idx_t               rf_rs3_idx;
+-  logic [DATA_WIDTH-1:0]  rf_rs3_data;
+   logic                   rf_wr_en;
+   reg_file_t              rf_wr_file;
+   reg_idx_t               rf_wr_idx;
+@@ -1107,7 +1133,6 @@ module tms34010_core
+   // FILL reads its implied B-file operands across two cycles via the three
+   // read ports: at EXECUTE — DADDR(B2) on port1, DPTCH(B3) on port2,
+   // DYDX(B7) on port3; at CORE_FILL_SETUP — COLOR1(B9) on port1.
+-  logic is_fill, fill_is_xy, is_pblt;
+   assign is_fill    = (decoded.iclass == INSTR_FILL_L) || (decoded.iclass == INSTR_FILL_XY);
+   assign fill_is_xy = (decoded.iclass == INSTR_FILL_XY);
+   // PIXBLT reads its 5 implied B-file operands across two cycles: at EXECUTE —
+@@ -1116,12 +1141,10 @@ module tms34010_core
+   assign is_pblt    = (decoded.iclass == INSTR_PIXBLT_LL);
+   // DRAV: at EXECUTE — Rs on port1, Rd on port2, OFFSET(B4) on port3 (for the
+   // XY->linear conversion of Rd); in CORE_DRAV — COLOR1(B9) on port1.
+-  logic is_drav;
+   assign is_drav    = (decoded.iclass == INSTR_DRAV);
+   // LINE: 3 setup cycles read the implied B operands —
+   //   SETUP1: d(B0)/DYDX(B7)/COUNT(B10);  SETUP2: INC1(B11)/INC2(B12)/OFFSET(B4);
+   //   SETUP3: DADDR(B2)/COLOR1(B9).  All reads are from the B file.
+-  logic is_line;
+   assign is_line    = (decoded.iclass == INSTR_LINE);
+   logic line_rd_b;   // LINE is doing B-file setup reads this cycle
+   assign line_rd_b  = is_line && ((state_q == CORE_LINE_SETUP1)
+@@ -1297,9 +1320,7 @@ module tms34010_core
+   //      merged = (processed & ~pmask) | (dest & pmask).
+   // `pixt_rmw` selects this path; a regular MOVE store (no force_pixel) stays
+   // a single write.
+-  logic                  pixt_rmw;
+   logic [DATA_WIDTH-1:0] pixt_pmask_field;
+-  logic [DATA_WIDTH-1:0] pix_dest_q;     // dest pixel latched at the read step
+   logic [DATA_WIDTH-1:0] pixt_processed; // PPOP(src, dest)
+   logic                  pixt_transp;    // transparency inhibits this write
+   logic [DATA_WIDTH-1:0] pixt_merged;    // value written at step 1
+@@ -1317,9 +1338,7 @@ module tms34010_core
+   // tested. Drawn for W=0, or W=2/W=3 when inside; W=1 never draws. V (W!=0) =
+   // NOT inside; WVP on a W=1 hit (inside) or W=2 miss (outside). Gated by
+   // pixt_xy_win so a regular MOVE / non-XY PIXT / W=0 PIXT is unaffected.
+-  logic                  pixt_xy_win;
+   logic [DATA_WIDTH-1:0] pixt_wstart_q, pixt_wend_q;
+-  logic                  pixt_inside_q;     // latched at the RMW write step
+   logic                  pixt_in_window, pixt_clip_out;
+   assign pixt_xy_win  = pixt_rmw && decoded.xy_addr
+                      && (io_control[CTRL_W_HI:CTRL_W_LO] != 2'd0);
+@@ -1355,7 +1374,6 @@ module tms34010_core
+   // (store), CONVSP for a source pointer (load). OFFSET = B4 (read port 3).
+   logic [15:0]           pix_xy_conv;
+   logic [4:0]            pix_xy_yshift;
+-  logic [4:0]            pix_xy_xsh;
+   logic [DATA_WIDTH-1:0] pix_xy_linear;
+   assign pix_xy_conv   = is_mv_store ? io_convdp : io_convsp;
+   assign pix_xy_yshift = 5'd31 - pix_xy_conv[4:0];
+@@ -1381,7 +1399,6 @@ module tms34010_core
+   // pix_xy_linear above converts the SOURCE pointer (mv_ptr = rf_rs1 for the
+   // M2M) with CONVSP; the M2M destination (rf_rs2) converts with CONVDP.
+   logic [4:0]            pix_xy_dst_yshift;
+-  logic [DATA_WIDTH-1:0] pix_xy_dst_linear;
+   assign pix_xy_dst_yshift = 5'd31 - io_convdp[4:0];
+   assign pix_xy_dst_linear =
+       (({{16{rf_rs2_data[DATA_WIDTH-1]}}, rf_rs2_data[DATA_WIDTH-1:16]} << pix_xy_dst_yshift)
+@@ -1569,7 +1586,6 @@ module tms34010_core
+   // inference) and written back over 1 cycle (odd Rd: low 32 to Rd) or 2
+   // cycles (even Rd: hi 32 to Rd, then lo 32 to Rd+1). pair_wb_step (shared
+   // with DIVU) selects the second pass.
+-  logic                  is_mpy, mpy_signed, mpy_rd_even;
+   logic signed [63:0]    mpy_sprod;
+   logic        [63:0]    mpy_uprod, mpy_product, mpy_product_q;
+   assign is_mpy      = (decoded.iclass == INSTR_MPYS) || (decoded.iclass == INSTR_MPYU);
+@@ -1608,7 +1624,6 @@ module tms34010_core
+   // runs the multi-cycle divider via CORE_DIVIDE. The divider itself is
+   // unsigned; for the signed variants the core feeds |operands| and
+   // sign-conditions the results.
+-  logic                  is_div, is_divu, is_modu, is_divs, is_mods;
+   logic                  is_signed_div, is_div_mod, div_rd_even, div_use_pair;
+   logic [2*DATA_WIDTH-1:0] div_dividend;
+   logic [DATA_WIDTH-1:0]   div_divisor, div_quotient, div_remainder;
+@@ -1689,7 +1704,6 @@ module tms34010_core
+   //   positive result: |q| >= 2^31  -> overflow
+   //   negative result: |q| >  2^31  -> overflow (|q|==2^31 is -2^31, valid)
+   // (div_overflow already covers Rs=0 and |q| >= 2^32.)
+-  logic div_signed_ovf, div_v;
+   assign div_signed_ovf = div_overflow
+     || (is_signed_div &&
+         (div_result_neg ? (div_quotient[DATA_WIDTH-1] && (div_quotient[DATA_WIDTH-2:0] != '0))
+@@ -1700,7 +1714,6 @@ module tms34010_core
+   // Ops that write the {Rd, Rd+1} register pair over two WRITEBACK cycles.
+   // pair_wb_step selects the second pass (Rd+1). DIVU on overflow writes
+   // nothing, so it is not a pair-writeback op then.
+-  logic is_pair_wb, pair_second_pass, pair_wb_step;
+   assign is_pair_wb = (is_mpy && mpy_rd_even)
+                    || (div_use_pair && !div_v);   // DIVU/DIVS even (not MOD; not on overflow)
+   assign pair_second_pass = is_pair_wb && (pair_wb_step == 1'b0);
+@@ -2148,6 +2161,11 @@ module tms34010_core
+       // aligned (it is a vector word), so no bottom-nibble mask.
+       pc_load_en    = 1'b1;
+       pc_load_value = popped_pc_q;
++    end else if (state_q == CORE_RESET_VEC && mem_ack) begin
++      // P0001 (Arcade-SmashTV): load the reset PC directly from the vector
++      // word as it is acked (mem_size = 32, so mem_rdata_eff is the full PC).
++      pc_load_en    = 1'b1;
++      pc_load_value = mem_rdata_eff;
+     end
+   end
+ 
+@@ -2182,17 +2200,10 @@ module tms34010_core
+   // 16-bit; the core accesses them with 16-bit fields (set FS=16).
+   logic                  io_is_io;
+   logic [15:0]           io_rdata16;
+-  logic [15:0]           io_psize;     // PSIZE register (pixel size, for PIXT/CVXYL)
+-  logic [15:0]           io_convdp;    // CONVDP register (XY->linear dest pitch)
+-  logic [15:0]           io_convsp;    // CONVSP register (XY->linear source pitch)
+-  logic [15:0]           io_control;   // CONTROL register (PPOP, T, window mode, ...)
+-  logic [15:0]           io_pmask;     // PMASK register (plane mask)
+   logic [15:0]           io_intenb;    // INTENB register (maskable-interrupt enables)
+   logic [15:0]           io_intpend;   // INTPEND register (maskable-interrupt pending)
+   logic [15:0]           io_hstctlh;   // HSTCTLH register (host control; NMI/NMIM bits)
+   logic                  nmi_clear;    // pulse to clear HSTCTLH.NMI on taking the NMI
+-  logic                  wvp_set;      // pulse to set INTPEND.WV on a window violation
+-  logic [DATA_WIDTH-1:0] mem_rdata_eff;
+   logic                  mem_we_int;   // the FSM's write intent (pre-I/O gating)
+   tms34010_io_regs u_io_regs (
+     .clk      (clk),
+@@ -2249,7 +2260,6 @@ module tms34010_core
+   // nmi_clear pulses in CORE_INT_DONE when the latched entry was an NMI.
+   logic [ADDR_WIDTH-1:0] int_vec_q;
+   logic                  int_is_nmi_q;
+-  logic                  int_push_q;
+   always_ff @(posedge clk) begin
+     if (rst) begin
+       int_vec_q    <= '0;
+@@ -2448,8 +2458,19 @@ module tms34010_core
+ 
+     unique case (state_q)
+       CORE_RESET: begin
+-        // Unconditional one-cycle transition out of reset.
+-        state_d = CORE_FETCH;
++        // P0001 (Arcade-SmashTV): the TMS34010 loads its PC from the 32-bit
++        // reset vector at 0xFFFFFFE0 before executing. Go read it.
++        state_d = CORE_RESET_VEC;
++      end
++
++      CORE_RESET_VEC: begin
++        // P0001: fetch the reset PC from the level-0 (reset) trap vector.
++        // The PC-load comb loads pc from mem_rdata_eff on this ack.
++        mem_req  = 1'b1;
++        mem_we_int = 1'b0;
++        mem_addr = TRAP_VECTOR_BASE;   // 0xFFFF_FFE0
++        mem_size = MEM_SIZE_32;
++        if (mem_ack) state_d = CORE_FETCH;
+       end
+ 
+       CORE_FETCH: begin
+diff --git a/rtl/core/tms34010_decode.sv b/rtl/core/tms34010_decode.sv
+index 35fb6ff..2d15ed7 100644
+--- a/rtl/core/tms34010_decode.sv
++++ b/rtl/core/tms34010_decode.sv
+@@ -688,7 +688,12 @@ module tms34010_decode
+       decoded.rd_file     = reg_file_from_instr;
+       decoded.rd_idx      = reg_idx_from_instr;
+       decoded.needs_imm32 = 1'b1;
+-      decoded.alu_op      = ALU_OP_AND;
++      // P0003: TMS34010 ANDI stores the ONE'S COMPLEMENT of the mask in the
++      // immediate field (e.g. "ANDI 1Fh" encodes 0xFFFFFFE0), so the operation
++      // is Rd & ~imm, not Rd & imm. Use ALU_OP_ANDN (a & ~b). Plain ALU_OP_AND
++      // computed Rd & ~K and silently corrupted every ANDI (measured: field-size
++      // setup EXGF got A9=0 -> FS1=0 -> 32-bit palette fills). See PATCHES.md.
++      decoded.alu_op      = ALU_OP_ANDN;
+       decoded.wb_reg_en   = 1'b1;
+       decoded.wb_flags_en = 1'b1;
+     end
+diff --git a/rtl/tms34010_pkg.sv b/rtl/tms34010_pkg.sv
+index 421be70..7a85b94 100644
+--- a/rtl/tms34010_pkg.sv
++++ b/rtl/tms34010_pkg.sv
+@@ -100,7 +100,8 @@ package tms34010_pkg;
+     CORE_LINE_WB_DADDR  = 6'd34, // LINE: write back DADDR -> B2
+     CORE_LINE_WB_COUNT  = 6'd35, // LINE: write back COUNT (=0) -> B10
+     CORE_LINE_SETUP_WIN = 6'd36, // LINE (W=3): read WSTART/WEND for per-pixel clip
+-    CORE_PIXT_SETUP_WIN = 6'd37  // PIXT XY (W!=0): read WSTART/WEND before the RMW
++    CORE_PIXT_SETUP_WIN = 6'd37, // PIXT XY (W!=0): read WSTART/WEND before the RMW
++    CORE_RESET_VEC      = 6'd38  // P0001 (Arcade-SmashTV): reset -> read PC from vector 0xFFFFFFE0
+   } core_state_t;
+ 
+   // ---------------------------------------------------------------------------
+diff --git a/sim/tb/tb_immi_il.sv b/sim/tb/tb_immi_il.sv
+index 9e3a0d3..0e4b9fa 100644
+--- a/sim/tb/tb_immi_il.sv
++++ b/sim/tb/tb_immi_il.sv
+@@ -146,8 +146,11 @@ module tb_immi_il;
+     p = place_movi_il(p, REG_FILE_A, 4'd3, 32'hCAFE_BABE);
+     p = place_imm_il (p, CMPI_IL_TOP11, REG_FILE_A, 4'd3, 32'hCAFE_BABE);
+ 
++    // ANDI stores the ONE'S COMPLEMENT of the mask in the immediate field
++    // (TI assembler + real ROM: "ANDI 1Fh" -> 0xFFFFFFE0). CPU does Rd & ~imm.
++    // Encode ~0x0FF0FF0F = 0xF00F00F0 so the effective mask is 0x0FF0FF0F. (P0003)
+     p = place_movi_il(p, REG_FILE_A, 4'd4, 32'hF0F0_F0F0);
+-    p = place_imm_il (p, ANDI_IL_TOP11, REG_FILE_A, 4'd4, 32'h0FF0_FF0F);
++    p = place_imm_il (p, ANDI_IL_TOP11, REG_FILE_A, 4'd4, 32'hF00F_00F0);
+ 
+     p = place_movi_il(p, REG_FILE_A, 4'd5, 32'h0F0F_0F0F);
+     p = place_imm_il (p, ORI_IL_TOP11, REG_FILE_A, 4'd5, 32'hF0F0_F0F0);
+-- 
+2.53.0.windows.2
+

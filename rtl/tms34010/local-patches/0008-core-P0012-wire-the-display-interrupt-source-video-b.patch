@@ -1,0 +1,189 @@
+From a29b93d9cedfb9b20c0158c69d94b527b55918f9 Mon Sep 17 00:00:00 2001
+From: Matt Levine <blahm1d@gmail.com>
+Date: Sun, 5 Jul 2026 12:00:01 -0800
+Subject: [PATCH 08/12] core: P0012 - wire the display-interrupt source (video
+ block -> INTPEND.DI)
+
+The core had full interrupt-taking machinery + a tms34010_video timing
+block that emits dpyint_pulse, but nothing instantiated the video block
+or connected its pulse to INTPEND, so INTPEND.DI was never set. Smash
+T.V.'s main loop is frame-synced on a RAM flag (@0x1086760) that the
+display-interrupt handler sets each frame; with no DI firing the loop
+spun forever (the post-P0011 steady-loop state).
+
+Measured (tb_yunit_intstate): at the main loop ST.IE=1, INTENB=0x0404
+(DINT+INT2), DPYINT=0x9a, VTOTAL=0x120, HTOTAL=0xfc -- the game fully
+programmed the display interrupt and only waits on INTPEND.DI.
+
+Fix (tms34010_io_regs.sv): instantiate tms34010_video fed by the stored
+timing regs; set INTPEND[INT_DI_BIT] on dpyint_pulse (gated on VTOTAL!=0
+to avoid reset-state spam). After this the CPU takes the display
+interrupt, the handler sets the flag, and the main loop advances and
+calls the per-frame render (ffeaefc0) -- 18 frames rendered. MM unit TBs
+still PASS.
+
+New frontier exposed: after ~40 interrupts the first full-context
+interrupt handler (epilogue ffe0ef80: MMFM A0-A14; MMFM B0-B5; RETI)
+RETIs to 0x00020010 (VRAM garbage). SP doesn't drift at the main loop,
+so it's a bad interrupt return -- first real exercise of the core's
+push/RETI path. Documented in PATCHES.md P0012.
+
+---
+ PATCHES.md                 | 48 ++++++++++++++++++++++++
+ rtl/io/tms34010_io_regs.sv | 77 ++++++++++++++++++++++++++++++++------
+ 2 files changed, 113 insertions(+), 12 deletions(-)
+
+diff --git a/PATCHES.md b/PATCHES.md
+index c566181..e851a99 100644
+--- a/PATCHES.md
++++ b/PATCHES.md
+@@ -403,3 +403,51 @@ integrated boot (`tb_yunit_derail`) runs past the old derail.
+ **Upstream note.** Real core bug, not Y-unit-specific — offer upstream to birdybro
+ together with the reversed-MMTM unit vectors (birdybro's round-trip TB used the same
+ word for push and pop, the exact blind spot that hid this — same family as P0003/P0008).
++
++---
++
++## P0012 — wire the display-interrupt source (INTEGRATION, was upstream Task 0097)
++
++**Status:** ✅ APPLIED 2026-07-05 (integration, not a bug fix). `grep -rn P0012 rtl/`.
++
++**Applied edits (both in `rtl/io/tms34010_io_regs.sv`):**
++- Instantiate the vendored `rtl/video/tms34010_video` block, fed by the video-timing
++  registers already stored in `io_reg[]` (HESYNC…VTOTAL, DPYINT); it produces
++  `dpyint_pulse` (1-clock strobe at the start of the DPYINT scan line).
++- In the register `always_ff`, set `INTPEND[INT_DI_BIT]` on `dpyint_pulse` (gated on
++  `VTOTAL != 0` so the all-zero reset state doesn't spam it). Kept independent of the
++  I/O-write else-if chain so a coincident write to another register can't drop a frame.
++
++**Problem.** The core had **full interrupt-taking machinery** (`int_ctrl`: take when
++`ST.IE && (INTPEND & INTENB)`, plus `CORE_INT_PUSH_PC/ST/VECTOR/DONE`) and a complete
++`tms34010_video` timing block that emits `dpyint_pulse` — but **nothing instantiated
++the video block or connected its pulse to INTPEND**, so `INTPEND.DI` was never set.
++Smash T.V.'s main loop is frame-synced: it spins on a RAM flag (`@0x1086760`) that the
++**display-interrupt handler** sets each frame (the handler also writes `DPYINT`
++`@0xC00000A0` to reschedule and clears `INTPEND` `@0xC0000120`); the main loop clears
++the flag and does per-frame work. With no DI ever firing, the flag never set → the loop
++spun forever (the post-P0011 "settles into a steady loop" state).
++
++**Evidence (measured, `sim/tb_yunit_intstate.sv`).** At the main loop our sim has
++`ST.IE=1`, `INTENB=0x0404` (DINT bit10 + INT2), `DPYINT=0x9a`, `VTOTAL=0x120`,
++`HTOTAL=0xfc` — i.e. the game fully programmed the display interrupt and is only
++waiting for `INTPEND.DI`. After wiring: `INTPEND.DI` sets ~once per frame
++(~72,576-clk period), the CPU **takes the display interrupt**, the handler sets the
++flag, and the **main loop advances past its spin and calls the per-frame render**
++(`ffeaefc0`) — 18 frames rendered before the new frontier below. MM unit TBs
++(`tb_mmtm/mmfm/mmtm_nflag`) still PASS (no regression from the io_regs change).
++
++**Clock-domain note.** The video block is clocked by the io_regs `clk` (CPU domain).
++On real HW display timing lives in the VCLK (pixel-clock) domain; since the core is
++not cycle-accurate yet, a CPU-clock-driven periodic DI is exactly what the frame-sync
++loop needs. Moving it to VCLK is a Phase 6 (HW) concern.
++
++**NEW FRONTIER this exposed — first real exercise of the interrupt/RETI path derails.**
++After ~40 interrupts / 18 rendered frames the boot derails: a full-context interrupt
++handler epilogue at `ffe0ef80` (`MMFM SP,A0-A14`; `MMFM SP,B0-B5`; `RETI` @`ffe0efc0`)
++**RETIs to `0x00020010`** (VRAM garbage). SP does **not** drift at the main-loop top
++(rules out a steady stack leak), so this is a bad interrupt return — the core's
++`CORE_INT_PUSH_PC/ST` ↔ `RETI` pop, or nested-interrupt handling, is the suspect (this
++is the very first time a real game drives the core's interrupt path). NEXT: MAME-diff
++the push/RETI stack layout for this handler (dump the words RETI pops as ST/PC vs
++MAME); check push order (PC then ST) and the RETI SP arithmetic against the UG.
+diff --git a/rtl/io/tms34010_io_regs.sv b/rtl/io/tms34010_io_regs.sv
+index e7c5412..c00e5f9 100644
+--- a/rtl/io/tms34010_io_regs.sv
++++ b/rtl/io/tms34010_io_regs.sv
+@@ -80,6 +80,45 @@ module tms34010_io_regs
+   // Register storage.
+   logic [15:0] io_reg [0:IO_REG_COUNT-1];
+ 
++  // ---------------------------------------------------------------------------
++  // Display-interrupt source (P0012, integration — was upstream Task 0097).
++  // The vendored `tms34010_video` block generates DPYINT_PULSE (a 1-clock strobe
++  // at the start of the scan line == DPYINT) from the video-timing registers,
++  // but the core never instantiated it, so INTPEND.DI was never set and any
++  // frame-synced game (e.g. Smash T.V.'s main loop, which spins on a RAM flag
++  // set by the display-interrupt handler) never advanced. Wire it here where all
++  // the timing registers already live. Clocked by the io_regs clk; on real HW
++  // this belongs in the VCLK (pixel-clock) domain (Phase 6 concern) — for the
++  // non-cycle-accurate sim, clk gives a periodic per-"frame" DI, which is all
++  // the frame-sync loop needs. hcount/vcount are left as CPU-visible stored
++  // registers (the game does not read them here).
++  // ---------------------------------------------------------------------------
++  logic        dpyint_pulse;
++  logic [15:0] vid_hcount_unused, vid_vcount_unused;
++  logic        vid_hs_unused, vid_vs_unused, vid_hb_unused, vid_vb_unused, vid_bl_unused;
++
++  tms34010_video u_video (
++    .clk         (clk),
++    .rst         (rst),
++    .hesync      (io_reg[IO_IDX_HESYNC]),
++    .heblnk      (io_reg[IO_IDX_HEBLNK]),
++    .hsblnk      (io_reg[IO_IDX_HSBLNK]),
++    .htotal      (io_reg[IO_IDX_HTOTAL]),
++    .vesync      (io_reg[IO_IDX_VESYNC]),
++    .veblnk      (io_reg[IO_IDX_VEBLNK]),
++    .vsblnk      (io_reg[IO_IDX_VSBLNK]),
++    .vtotal      (io_reg[IO_IDX_VTOTAL]),
++    .dpyint      (io_reg[IO_IDX_DPYINT]),
++    .hcount      (vid_hcount_unused),
++    .vcount      (vid_vcount_unused),
++    .hsync       (vid_hs_unused),
++    .vsync       (vid_vs_unused),
++    .hblank      (vid_hb_unused),
++    .vblank      (vid_vb_unused),
++    .blank       (vid_bl_unused),
++    .dpyint_pulse(dpyint_pulse)
++  );
++
+   // Async read: the selected register, or 0 when the address is not in
+   // I/O space (so a non-I/O read contributes nothing to a merged read bus).
+   assign rdata = is_io ? io_reg[idx] : 16'h0;
+@@ -101,18 +140,32 @@ module tms34010_io_regs
+       for (int i = 0; i < IO_REG_COUNT; i++) begin
+         io_reg[i] <= 16'h0;
+       end
+-    end else if (req && we && is_io) begin
+-      io_reg[idx] <= wdata;
+-    end else if (nmi_clear) begin
+-      // The device automatically clears HSTCTLH.NMI when it takes the NMI
+-      // (1988 UG §8). A normal I/O write takes precedence (the else-if order):
+-      // simultaneous host write + take is a don't-care corner.
+-      io_reg[IO_IDX_HSTCTLH][HSTCTL_NMI_BIT] <= 1'b0;
+-    end else if (wvp_set) begin
+-      // The graphics engine sets INTPEND.WV on a window violation (1988 UG
+-      // §7.10). Like nmi_clear, this is a device-internal set, lower priority
+-      // than a host/program I/O write.
+-      io_reg[IO_IDX_INTPEND][INT_WV_BIT] <= 1'b1;
++    end else begin
++      if (req && we && is_io) begin
++        io_reg[idx] <= wdata;
++      end else if (nmi_clear) begin
++        // The device automatically clears HSTCTLH.NMI when it takes the NMI
++        // (1988 UG §8). A normal I/O write takes precedence (the else-if order):
++        // simultaneous host write + take is a don't-care corner.
++        io_reg[IO_IDX_HSTCTLH][HSTCTL_NMI_BIT] <= 1'b0;
++      end else if (wvp_set) begin
++        // The graphics engine sets INTPEND.WV on a window violation (1988 UG
++        // §7.10). Like nmi_clear, this is a device-internal set, lower priority
++        // than a host/program I/O write.
++        io_reg[IO_IDX_INTPEND][INT_WV_BIT] <= 1'b1;
++      end
++      // Display interrupt (P0012): set INTPEND.DI at the DPYINT scan line.
++      // Independent of the else-if chain above so a coincident I/O write to a
++      // DIFFERENT register cannot drop the frame's DI. A same-cycle write to
++      // INTPEND itself: this bit-select assign wins for bit DI (set-dominant),
++      // matching the device-sets / software-clears model (the handler clears DI
++      // by writing INTPEND). One-clock strobe, so it never fights RETI.
++      // Gate on a programmed raster (VTOTAL != 0) so the reset state (all
++      // timing regs 0 -> pulse every clock) doesn't spam INTPEND.DI before the
++      // game sets up video. Harmless while IE=0, but keep it clean.
++      if (dpyint_pulse && io_reg[IO_IDX_VTOTAL] != 16'h0) begin
++        io_reg[IO_IDX_INTPEND][INT_DI_BIT] <= 1'b1;
++      end
+     end
+   end
+ 
+-- 
+2.53.0.windows.2
+
