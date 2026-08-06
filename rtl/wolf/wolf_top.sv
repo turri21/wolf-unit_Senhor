@@ -13,9 +13,11 @@
 // Clocking: `clk` runs CPU (gated by cpu_ce) / memory / SDRAM / video; `ce_pix` gates the
 // raster. clk_snd / rst_pon are unused this phase (DCS deferred).
 `default_nettype none
+
+import yunit_pkg::*;
+import tms34010_pkg::*;
+
 module wolf_top
-  import yunit_pkg::*;
-  import tms34010_pkg::*;
 #(
   parameter ROM_HEX = "umk3_maindata.hex",
   parameter logic [127:0] PIC_RESPONSE_BYTES =
