@@ -14,9 +14,11 @@
 // raster; `clk_snd` (~12 MHz) runs the sound board. Game/CPU speed calibration
 // (the real 34010 runs far slower than the SDRAM clock) is a later tuning knob.
 `default_nettype none
+
+import yunit_pkg::*;
+import tms34010_pkg::*;
+
 module yunit_top
-  import yunit_pkg::*;
-  import tms34010_pkg::*;
 #(
   parameter ROM_HEX = "smashtv_maindata.hex",
   // video geometry (Smash T.V. stdres; see yunit_video)
