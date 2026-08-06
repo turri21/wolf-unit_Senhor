@@ -6,7 +6,7 @@
 set_global_assignment -name SDC_FILE rtl/sdram.sdc
 
 # --- emu wrapper (Quartus-native SystemVerilog; instantiates yunit_top by name) ---
-set_global_assignment -name SYSTEMVERILOG_FILE Arcade-SmashTV.sv
+set_global_assignment -name SYSTEMVERILOG_FILE Arcade-WolfUnit.sv
 
 # --- USE_DDR3_GFX only: gfx ROM download interleave transform (plain comb SV, no sv2v needed) ---
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/wolf/wolf_gfx_interleave.sv
@@ -25,3 +25,46 @@ set_global_assignment -name VHDL_FILE rtl/sound/williams_cvsd/pia6821.vhd
 set_global_assignment -name VHDL_FILE rtl/sound/williams_cvsd/williams_cvsd_board.vhd
 set_global_assignment -name VERILOG_FILE rtl/sound/williams_cvsd/mc6809is.v
 set_global_assignment -name QIP_FILE rtl/sound/jt51/hdl/jt51.qip
+
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/pkg/wolf_pkg.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/pkg/yunit_pkg.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tms34010/rtl/tms34010_pkg.sv
+
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tms34010/rtl/core/tms34010_alu.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tms34010/rtl/core/tms34010_core.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tms34010/rtl/core/tms34010_decode.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tms34010/rtl/core/tms34010_divider.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tms34010/rtl/core/tms34010_int_ctrl.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tms34010/rtl/core/tms34010_pc.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tms34010/rtl/core/tms34010_regfile.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tms34010/rtl/core/tms34010_shifter.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tms34010/rtl/core/tms34010_status_reg.sv
+
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tms34010/rtl/io/tms34010_io_regs.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tms34010/rtl/video/tms34010_video.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tms34010/rtl/video/tms34010_refresh.sv
+
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/yunit/yunit_mem_cdc.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/yunit/yunit_video.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/yunit/yunit_video_top.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/yunit/yunit_top.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/yunit/yunit_scanline.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/yunit/yunit_palram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/yunit/yunit_memsys.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/yunit/yunit_mem.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/yunit/yunit_gfx_unpack.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/yunit/yunit_dma.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/yunit/vram_sdram_top.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/yunit/vram_sdram.sv
+
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram/sdram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram/sdram_burst.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram/sdram_phy.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram/sdram_stock.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram/stv_vram_ddr_agent.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram/stv_vram_ddr_top.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram/wolf_dcs_ddr_top.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram/wolf_ddr3_arb.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram/wolf_gfx_ddr_top.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram/yunit_sdram_adapter.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram/yunit_sdram_arb.sv
