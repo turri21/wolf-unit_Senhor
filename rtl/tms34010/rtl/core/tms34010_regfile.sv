@@ -45,28 +45,28 @@ module tms34010_regfile
   input  wire logic                  rst,
 
   // Read port 1.
-  input  wire reg_file_t             rs1_file,
-  input  wire reg_idx_t              rs1_idx,
+  input  reg_file_t             rs1_file,
+  input  reg_idx_t              rs1_idx,
   output logic [DATA_WIDTH-1:0] rs1_data,
 
   // Read port 2.
-  input  wire reg_file_t             rs2_file,
-  input  wire reg_idx_t              rs2_idx,
+  input  reg_file_t             rs2_file,
+  input  reg_idx_t              rs2_idx,
   output logic [DATA_WIDTH-1:0] rs2_data,
 
   // Read port 3. Added for instructions that need a third simultaneous
   // source — currently CPW (reads the point plus WSTART and WEND). Async
   // read like the others; a third read mux on this flop-based file is
   // cheap (no extra memory blocks).
-  input  wire reg_file_t             rs3_file,
-  input  wire reg_idx_t              rs3_idx,
+  input  reg_file_t             rs3_file,
+  input  reg_idx_t              rs3_idx,
   output logic [DATA_WIDTH-1:0] rs3_data,
 
   // Write port.
-  input  wire logic                  wr_en,
-  input  wire reg_file_t             wr_file,
-  input  wire reg_idx_t              wr_idx,
-  input  wire logic [DATA_WIDTH-1:0] wr_data,
+  input  logic                  wr_en,
+  input  reg_file_t             wr_file,
+  input  reg_idx_t              wr_idx,
+  input  logic [DATA_WIDTH-1:0] wr_data,
 
   // Observability: SP value, used by testbenches and (eventually) host
   // interface debug paths.

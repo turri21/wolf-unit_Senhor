@@ -40,10 +40,12 @@
 // -----------------------------------------------------------------------------
 
 `default_nettype none
-module tms34010_decode
+
   import tms34010_pkg::*;
+
+module tms34010_decode
 (
-  input  wire instr_word_t    instr,
+  input  instr_word_t    instr,
   output var decoded_instr_t decoded
 );
 

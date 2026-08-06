@@ -36,24 +36,26 @@
 // -----------------------------------------------------------------------------
 
 `default_nettype none
+
+import tms34010_pkg::*;
+
 module tms34010_status_reg
-  import tms34010_pkg::*;
 (
-  input  wire logic                  clk,
-  input  wire logic                  ce_cpu,   // P0019: CPU clock-enable (see tms34010_core)
-  input  wire logic                  rst,
+  input  logic                  clk,
+  input  logic                  ce_cpu,   // P0019: CPU clock-enable (see tms34010_core)
+  input  logic                  rst,
 
   // Selective flag update from ALU/shifter.
-  input  wire logic                  flag_update_en,
-  input  wire alu_flags_t            flags_in,
+  input  logic                  flag_update_en,
+  input  alu_flags_t            flags_in,
   // Per-flag mask: which of N, C, Z, V should actually update when
   // `flag_update_en` is high. All-ones is the standard case (full
   // arithmetic flag update). BTST sets only `z`. ABS sets all but `c`.
-  input  wire alu_flags_t            flag_update_mask,
+  input  alu_flags_t            flag_update_mask,
 
   // Full ST write (POPST, MMFM-of-ST, debug load, etc.).
-  input  wire logic                  st_write_en,
-  input  wire logic [DATA_WIDTH-1:0] st_write_data,
+  input  logic                  st_write_en,
+  input  logic [DATA_WIDTH-1:0] st_write_data,
 
   // Outputs.
   output logic [DATA_WIDTH-1:0] st_o,

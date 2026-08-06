@@ -44,16 +44,16 @@
 // -----------------------------------------------------------------------------
 
 `default_nettype none
-module tms34010_alu
-  import tms34010_pkg::*;
-(
-  input  wire alu_op_t                 op,
-  input  wire logic [DATA_WIDTH-1:0]   a,
-  input  wire logic [DATA_WIDTH-1:0]   b,
-  input  wire logic                    cin,   // ST.C for ADDC; borrow-in for SUBB
 
+import tms34010_pkg::*;
+
+module tms34010_alu (
+  input  alu_op_t                 op,
+  input  logic [DATA_WIDTH-1:0]   a,
+  input  logic [DATA_WIDTH-1:0]   b,
+  input  logic                    cin,   // ST.C for ADDC; borrow-in for SUBB
   output logic [DATA_WIDTH-1:0]   result,
-  output var alu_flags_t              flags
+  output alu_flags_t              flags
 );
 
   // ---------------------------------------------------------------------------

@@ -37,17 +37,19 @@
 // -----------------------------------------------------------------------------
 
 `default_nettype none
-module tms34010_io_regs
-  import tms34010_pkg::*;
-(
-  input  wire logic                  clk,
-  input  wire logic                  rst,
 
-  input  wire logic                  req,      // access strobe
-  input  wire logic                  we,       // 1 = write, 0 = read
-  input  wire logic [ADDR_WIDTH-1:0] addr,     // full 32-bit bit-address
-  input  wire logic [FIELD_SIZE_WIDTH-1:0] size,// field width in bits
-  input  wire logic [DATA_WIDTH-1:0] wdata,    // full field (low 16 for contained
+import tms34010_pkg::*;
+
+module tms34010_io_regs
+(
+  input  logic                  clk,
+  input  logic                  rst,
+
+  input  logic                  req,      // access strobe
+  input  logic                  we,       // 1 = write, 0 = read
+  input  logic [ADDR_WIDTH-1:0] addr,     // full 32-bit bit-address
+  input  logic [FIELD_SIZE_WIDTH-1:0] size,// field width in bits
+  input  logic [DATA_WIDTH-1:0] wdata,    // full field (low 16 for contained
                                                // writes; hi bits span into idx+1)
 
   // Pixel-clock ENABLE for the video-timing counters (u_video). Threaded from
@@ -75,13 +77,13 @@ module tms34010_io_regs
   output logic [15:0]           dpyadr_o, // live DPYADR page; software may override it in vblank
   output logic                  vblank_start_o, // edge where hardware loads DPYADR from DPYSTRT
   output logic [15:0]           hstctlh_o,// HSTCTLH: host control (NMI/NMIM in bits 8/9)
-  input  wire logic                  nmi_clear,// 1-cycle: clear HSTCTLH.NMI (device took NMI)
-  input  wire logic                  wvp_set,  // 1-cycle: set INTPEND.WV (window violation)
+  input  logic                  nmi_clear,// 1-cycle: clear HSTCTLH.NMI (device took NMI)
+  input  logic                  wvp_set,  // 1-cycle: set INTPEND.WV (window violation)
   // P0016: external interrupt pin LINT1 (level). Per the 1988 UG §8.3 the
   // INTPEND.X1P bit REFLECTS the pin level (it is not a latch and cannot be
   // cleared by writing INTPEND) -- so it is OR-mirrored into the INTPEND view
   // (both the dedicated intpend_o tap and CPU reads of the register).
-  input  wire logic                  lint1_in,
+  input  logic                  lint1_in,
 
   // Dynamic display geometry (Phase 2B): expose display timing registers for runtime
   // video geometry adaptation (Rampage reprograms these at runtime). Video module

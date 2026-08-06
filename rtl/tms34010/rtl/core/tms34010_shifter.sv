@@ -34,12 +34,14 @@
 // -----------------------------------------------------------------------------
 
 `default_nettype none
+
+import tms34010_pkg::*;
+
 module tms34010_shifter
-  import tms34010_pkg::*;
 (
-  input  wire shift_op_t                       op,
-  input  wire logic [DATA_WIDTH-1:0]           a,
-  input  wire logic [SHIFT_AMOUNT_WIDTH-1:0]   amount,
+  input  shift_op_t                       op,
+  input  logic [DATA_WIDTH-1:0]           a,
+  input  logic [SHIFT_AMOUNT_WIDTH-1:0]   amount,
 
   output logic [DATA_WIDTH-1:0]           result,
   output var alu_flags_t                      flags

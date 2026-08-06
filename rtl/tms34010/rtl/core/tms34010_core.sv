@@ -42,22 +42,24 @@
 // -----------------------------------------------------------------------------
 
 `default_nettype none
+
+import tms34010_pkg::*;
+
 module tms34010_core
-  import tms34010_pkg::*;
 (
-  input  wire logic                                clk,
-  input  wire logic                                ce_cpu,   // P0019 (Y-unit): CPU clock-enable. Runs the
+  input  logic                                clk,
+  input  logic                                ce_cpu,   // P0019 (Y-unit): CPU clock-enable. Runs the
                                                         // core on clk_sys gated /4 instead of a separate
                                                         // async clk_cpu PLL tap, eliminating the CPU<->
                                                         // memsys CDC (the HW-only "works in sim" bug).
                                                         // Tie high in legacy TBs to keep full-rate behavior.
-  input  wire logic                                ce_pix,   // P00xx: pixel-clock enable for the video-timing
+  input  logic                                ce_pix,   // P00xx: pixel-clock enable for the video-timing
                                                         // counters (io_regs.u_video) -> HCOUNT/dot,
                                                         // VCOUNT/line, DPYINT/frame at the DOT rate (not
                                                         // the core clock). UNCONNECTED in legacy TBs ->
                                                         // io_regs/u_video default to full rate (their own
                                                         // ce === 1'b0 guard), so those TBs are unaffected.
-  input  wire logic                                rst,
+  input  logic                                rst,
 
   // Memory request/valid interface (stub in Phase 0 skeleton).
   output logic                                mem_req,
@@ -80,14 +82,14 @@ module tms34010_core
   // Ordinary MOVE/field accesses and instruction fetches NEVER assert this
   // (gospel: only pixel ops are rerouted).
   output logic                                mem_srt,
-  input  wire logic [DATA_WIDTH-1:0]               mem_rdata,
-  input  wire logic                                mem_ack,
+  input  logic [DATA_WIDTH-1:0]               mem_rdata,
+  input  logic                                mem_ack,
 
   // Observability for testbenches (Phase 0..3 — may move to an
   // sva/observability bundle later).
-  output wire core_state_t                         state_o,
+  output core_state_t                         state_o,
   output logic [ADDR_WIDTH-1:0]               pc_o,
-  output wire instr_word_t                         instr_word_o,
+  output instr_word_t                         instr_word_o,
   output logic                                illegal_opcode_o,
   output logic [15:0]                         dpystrt_o,   // P0024: DPYSTRT tap (display double-buffer)
   output logic [15:0]                         dpyadr_o,    // live DPYADR page, including software override
@@ -102,7 +104,7 @@ module tms34010_core
   // P0016: external interrupt pin LINT1 (level; e.g. Y-unit DMA-done). Mirrored
   // into INTPEND.X1P by the io_regs block. X/Z-safe there, so legacy TBs that
   // leave this port unconnected keep working (unconnected == not asserted).
-  input  wire logic                                lint1_in
+  input   logic                                lint1_in
 );
 
   // ===== P0002 (Arcade-SmashTV): forward declarations hoisted for Questa FSE 25.1std
@@ -161,7 +163,7 @@ module tms34010_core
       5'h00:   ppop_apply = src;               // S (replace)
       5'h01:   ppop_apply = src &  dest;       // S AND D
       5'h02:   ppop_apply = src & ~dest;       // S AND ~D
-      5'h03:   ppop_apply = '0;                // 0
+      5'h03:   ppop_apply = 32'd0;                // 0
       5'h04:   ppop_apply = src | ~dest;       // S OR ~D
       5'h05:   ppop_apply = ~(src ^ dest);     // S XNOR D
       5'h06:   ppop_apply = ~dest;             // ~D
@@ -170,14 +172,14 @@ module tms34010_core
       5'h09:   ppop_apply = dest;              // D (no change)
       5'h0A:   ppop_apply = src ^  dest;       // S XOR D
       5'h0B:   ppop_apply = ~src & dest;       // ~S AND D
-      5'h0C:   ppop_apply = '1;                // 1
+      5'h0C:   ppop_apply = 32'd1;                // 1
       5'h0D:   ppop_apply = ~src | dest;       // ~S OR D
       5'h0E:   ppop_apply = ~(src & dest);     // S NAND D
       5'h0F:   ppop_apply = ~src;              // ~S
       5'h10:   ppop_apply = addsum;            // D + S (wrap)
       5'h11:   ppop_apply = (addsum > fmask) ? fmask : addsum;       // ADDS (sat all-1s)
       5'h12:   ppop_apply = dp - sp;           // D - S (wrap)
-      5'h13:   ppop_apply = (dp >= sp) ? (dp - sp) : '0;             // SUBS (sat 0)
+      5'h13:   ppop_apply = (dp >= sp) ? (dp - sp) : 32'd0;          // SUBS (sat 0)
       5'h14:   ppop_apply = (dp >= sp) ? dp : sp;                    // MAX(D,S)
       5'h15:   ppop_apply = (dp <= sp) ? dp : sp;                    // MIN(D,S)
       default: ppop_apply = src;               // 0x16-0x1F reserved -> replace
@@ -229,7 +231,7 @@ module tms34010_core
 
   always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
     if (rst) begin
-      instr_word_q <= '0;
+      instr_word_q <= 16'd0;
     end else if (state_q == CORE_FETCH && mem_ack) begin
       instr_word_q <= mem_rdata_eff[INSTR_WORD_WIDTH-1:0];
     end
@@ -316,9 +318,9 @@ module tms34010_core
   logic signed [9:0]     dsjs_disp_bits;
   // Build positive bit-offset = {1'b0, offset5, 4'h0} (signed 10-bit
   // value in [0, +496]), then negate when D=1.
-  assign dsjs_disp_bits = instr_word_q[10]
-                        ? -10'($signed({1'b0, instr_word_q[9:5], 4'h0}))
-                        :  10'($signed({1'b0, instr_word_q[9:5], 4'h0}));
+assign dsjs_disp_bits = instr_word_q[10]
+                       ? -(10'($signed({1'b0, instr_word_q[9:5], 4'h0})))
+                       :   10'($signed({1'b0, instr_word_q[9:5], 4'h0}));
   assign branch_target_dsjs = pc_value + ADDR_WIDTH'(dsjs_disp_bits);
 
   // ---------------------------------------------------------------------------
