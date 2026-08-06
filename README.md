@@ -1,3 +1,8 @@
+-=(WolfUnit_Senhor notes)=-
+
+Tested: Working Video 720p, 1080p & Sound.
+
+___
 # WOLF UNIT
 
 ### One core. Seven cabinets. Zero sleep cycles.
